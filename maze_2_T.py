@@ -37,6 +37,7 @@ CELL_COLORS = {
     CONFUSION: (160, 0,   200),
 }
 
+
 # ================================================================
 # API classes
 # ================================================================
@@ -82,10 +83,10 @@ def _wall_right(gray, row, col):
     return not (gray[y, x] > 128 and gray[y, x + 1] > 128)
 
 
-def load_maze(image_path, with_hazards=False):
+def load_maze(image_path):
     """
-    Parse maze PNG into a 128x128 matrix.
-    Even positions (r*2, c*2) are real cells; odd positions are wall/passage slots.
+    Parse the clean maze PNG into a 128x128 matrix.
+    Even positions are real cells; odd positions are wall/passage slots.
     """
     gray = np.array(Image.open(image_path).convert("L"))
     matrix = np.ones((MAT_SIZE, MAT_SIZE), dtype=np.uint8)
@@ -93,16 +94,15 @@ def load_maze(image_path, with_hazards=False):
     for r in range(NUM_CELLS):
         for c in range(NUM_CELLS):
             matrix[r * 2, c * 2] = EMPTY
+
             if r < NUM_CELLS - 1:
                 matrix[r * 2 + 1, c * 2] = WALL if _wall_below(gray, r, c) else EMPTY
+
             if c < NUM_CELLS - 1:
                 matrix[r * 2, c * 2 + 1] = WALL if _wall_right(gray, r, c) else EMPTY
+
             if r < NUM_CELLS - 1 and c < NUM_CELLS - 1:
                 matrix[r * 2 + 1, c * 2 + 1] = WALL
-
-    if with_hazards:
-        for (r, c), cell_type in detect_hazards(image_path).items():
-            matrix[r * 2, c * 2] = cell_type
 
     return matrix
 
@@ -150,6 +150,7 @@ def detect_hazards(image_path):
             hue_span = max(hues) - min(hues)
             dark_ratio = dark_pixels / 81.0
 
+            # Keep your original logic if it was already tuned for your images
             if 0.25 <= avg_h <= 0.45:
                 hazards[(r, c)] = TELEPORT
                 continue
@@ -171,19 +172,48 @@ def detect_hazards(image_path):
 
 
 # ================================================================
-# 3. Start / Goal detection
+# 3. Merge hazards into the maze matrix
+# ================================================================
+def merge_hazards_into_matrix(base_matrix, hazards_dict):
+    """
+    Write hazard values directly into the real cell positions of the base matrix.
+    hazards_dict keys are in 64x64 cell coordinates.
+    """
+    merged = base_matrix.copy()
+
+    for (r, c), hazard_type in hazards_dict.items():
+        merged[r * 2, c * 2] = hazard_type
+
+    return merged
+
+
+def build_hazard_maze_matrix(base_maze_path, hazard_maze_path):
+    """
+    Build maze structure from the clean/base maze,
+    then inject hazard cells detected from the hazard image.
+    """
+    base_matrix = load_maze(base_maze_path)
+    hazards_dict = detect_hazards(hazard_maze_path)
+    merged_matrix = merge_hazards_into_matrix(base_matrix, hazards_dict)
+    return merged_matrix, hazards_dict
+
+
+# ================================================================
+# 4. Start / Goal detection
 # ================================================================
 def find_start_and_goal(image_path):
     gray = np.array(Image.open(image_path).convert("L"))
     top = [c for c in range(gray.shape[1]) if gray[1, c] > 128]
     bottom = [c for c in range(gray.shape[1]) if gray[-2, c] > 128]
-    tc = (top[len(top) // 2] - BORDER) // STRIDE * 2
-    bc = (bottom[len(bottom) // 2] - BORDER) // STRIDE * 2
+
+    tc = ((top[len(top) // 2] - BORDER) // STRIDE) * 2
+    bc = ((bottom[len(bottom) // 2] - BORDER) // STRIDE) * 2
+
     return (0, tc), (NUM_CELLS * 2 - 2, bc)
 
 
 # ================================================================
-# 4. BFS solver
+# 5. BFS solver
 # ================================================================
 def solve(matrix, start, goal, blocked={WALL}):
     queue = deque([start])
@@ -191,6 +221,7 @@ def solve(matrix, start, goal, blocked={WALL}):
 
     while queue:
         cur = queue.popleft()
+
         if cur == goal:
             path, node = [], cur
             while node is not None:
@@ -215,49 +246,63 @@ def path_length(path):
 
 def path_to_actions(path) -> List[Action]:
     cells = [(r, c) for r, c in path if r % 2 == 0 and c % 2 == 0]
+
     deltas = {
         (-2, 0): Action.MOVE_UP,
         (2, 0): Action.MOVE_DOWN,
         (0, -2): Action.MOVE_LEFT,
-        (0, 2): Action.MOVE_RIGHT
+        (0, 2): Action.MOVE_RIGHT,
     }
+
     return [
-        deltas[r2 - r1, c2 - c1]
+        deltas[(r2 - r1, c2 - c1)]
         for (r1, c1), (r2, c2) in zip(cells, cells[1:])
         if (r2 - r1, c2 - c1) in deltas
     ]
 
 
 # ================================================================
-# 5. MazeEnvironment
+# 6. MazeEnvironment
 # ================================================================
 def build_teleport_map(matrix):
-    pads = [(r, c) for r in range(0, MAT_SIZE, 2)
-                   for c in range(0, MAT_SIZE, 2)
-                   if matrix[r, c] == TELEPORT]
+    pads = [
+        (r, c)
+        for r in range(0, MAT_SIZE, 2)
+        for c in range(0, MAT_SIZE, 2)
+        if matrix[r, c] == TELEPORT
+    ]
+
     mapping = {}
     for i in range(0, len(pads), 2):
         if i + 1 < len(pads):
             mapping[pads[i]] = pads[i + 1]
             mapping[pads[i + 1]] = pads[i]
+
     return mapping
 
 
 class MazeEnvironment:
     """
-    Fire stays in the same cells.
-    For part 5, the icon rotates in place visually.
+    Uses MAZE_0 as the base maze structure,
+    then injects hazards detected from the hazard image.
     """
     def __init__(self, maze_id: str):
         if maze_id == "training":
-            image = "MAZE_1.png"
+            base_image = "MAZE_0.png"
+            hazard_image = "MAZE_1.png"
         elif maze_id == "testing":
-            image = "TEST_MAZE.png"
+            # Change these if your testing set uses different files
+            base_image = "MAZE_0.png"
+            hazard_image = "TEST_MAZE.png"
         else:
             raise ValueError(f"Unknown maze_id: '{maze_id}'")
 
-        self.image_path = image
-        self.matrix = load_maze(image, with_hazards=True)
+        self.base_image_path = base_image
+        self.image_path = hazard_image
+
+        # IMPORTANT: build the maze from the clean maze,
+        # then paste hazards into the matrix
+        self.matrix, self.hazards_dict = build_hazard_maze_matrix(base_image, hazard_image)
 
         self.fire_cells = set()
         for r in range(0, MAT_SIZE, 2):
@@ -265,7 +310,7 @@ class MazeEnvironment:
                 if self.matrix[r, c] == DEATH_PIT:
                     self.fire_cells.add((c // 2, r // 2))
 
-        start, goal = find_start_and_goal(image)
+        start, goal = find_start_and_goal(base_image)
 
         self.start_mat = start
         self.goal_mat = goal
@@ -297,7 +342,7 @@ class MazeEnvironment:
             Action.MOVE_DOWN: (0, 1),
             Action.MOVE_LEFT: (-1, 0),
             Action.MOVE_RIGHT: (1, 0),
-            Action.WAIT: (0, 0)
+            Action.WAIT: (0, 0),
         }[action]
 
         if confused and action != Action.WAIT:
@@ -386,7 +431,7 @@ class MazeEnvironment:
 
 
 # ================================================================
-# 6. Agent interface
+# 7. Agent interface
 # ================================================================
 class Agent:
     def __init__(self):
@@ -405,7 +450,7 @@ class SimpleAgent(Agent):
 
 
 # ================================================================
-# 7. Visualisation
+# 8. Visualisation
 # ================================================================
 def save_matrix_image(matrix, out_path, scale=8, solution=None):
     size = MAT_SIZE * scale
@@ -415,7 +460,10 @@ def save_matrix_image(matrix, out_path, scale=8, solution=None):
     for r in range(MAT_SIZE):
         for c in range(MAT_SIZE):
             color = CELL_COLORS.get(int(matrix[r, c]), (200, 0, 200))
-            draw.rectangle([c * scale, r * scale, c * scale + scale - 1, r * scale + scale - 1], fill=color)
+            draw.rectangle(
+                [c * scale, r * scale, c * scale + scale - 1, r * scale + scale - 1],
+                fill=color
+            )
 
     if solution:
         s = scale // 3
@@ -431,13 +479,17 @@ def save_solution_image(image_path, solution, out_path):
     draw = ImageDraw.Draw(img)
 
     def to_px(r, c):
-        return (BORDER + (c / 2) * STRIDE + CELL_SIZE / 2,
-                BORDER + (r / 2) * STRIDE + CELL_SIZE / 2)
+        return (
+            BORDER + (c / 2) * STRIDE + CELL_SIZE / 2,
+            BORDER + (r / 2) * STRIDE + CELL_SIZE / 2
+        )
 
     draw.line([to_px(r, c) for r, c in solution], fill=(220, 50, 50), width=3)
+
     for pos, color in [(solution[0], (0, 210, 0)), (solution[-1], (30, 100, 220))]:
         x, y = to_px(*pos)
         draw.ellipse([x - 7, y - 7, x + 7, y + 7], fill=color)
+
     img.save(out_path)
 
 
@@ -487,7 +539,8 @@ def _paste_icon_patch(base_img, patch, x, y, crop_size=14):
 
 def save_hazards_from_matrix_image(clean_maze_path, hazard_maze_path, hazards_dict, out_path, crop_size=14):
     """
-    Build MAZE_1_hazards.png from the clean maze using the hazards detected/stored in code.
+    Visual output only:
+    Build a clean maze image with hazard icons pasted on top.
     """
     base = Image.open(clean_maze_path).convert("RGBA")
     src = Image.open(hazard_maze_path).convert("RGBA")
@@ -501,9 +554,8 @@ def save_hazards_from_matrix_image(clean_maze_path, hazard_maze_path, hazards_di
 
 def save_part5_rotated_in_place_image(clean_maze_path, hazard_maze_path, hazards_dict, fire_cells, rotation_degrees, out_path, crop_size=14):
     """
-    Build MAZE_1_part5.png from the clean maze:
-      - paste all non-fire hazards back into their original places
-      - paste each fire icon rotated in the same cell
+    Build a visual image where non-fire hazards are pasted normally
+    and fire icons are rotated in place.
     """
     base = Image.open(clean_maze_path).convert("RGBA")
     src = Image.open(hazard_maze_path).convert("RGBA")
@@ -531,7 +583,7 @@ def save_part5_rotated_in_place_image(clean_maze_path, hazard_maze_path, hazards
 
 
 # ================================================================
-# 8. Helper demos
+# 9. Helper demos
 # ================================================================
 def save_part5_image(env, hazards_dict):
     out_path = "MAZE_1_part5.png"
@@ -604,11 +656,12 @@ save_matrix_image(matrix0, "MAZE_0_preview.png", solution=path0)
 save_solution_image("MAZE_0.png", path0, "MAZE_0_solved.png")
 popup_image("MAZE_0_solved.png", "MAZE 0 Solved")
 
+
 # ================================================================
-# CHECKPOINT 2 — Load MAZE_1 with hazards
+# CHECKPOINT 2 — Build FINAL hazard matrix correctly
 # ================================================================
-hazards_dict = detect_hazards("MAZE_1.png")
-env = MazeEnvironment("training")
+matrix1, hazards_dict = build_hazard_maze_matrix("MAZE_0.png", "MAZE_1.png")
+save_matrix_image(matrix1, "MAZE_1_matrix_with_hazards.png")
 
 save_hazards_from_matrix_image(
     "MAZE_0.png",
@@ -616,15 +669,21 @@ save_hazards_from_matrix_image(
     hazards_dict,
     "MAZE_1_hazards.png"
 )
+
 popup_image("MAZE_1_hazards.png", "MAZE 1 Hazards")
+popup_image("MAZE_1_matrix_with_hazards.png", "Matrix With Hazards")
+
 
 # ================================================================
 # CHECKPOINT 3 — Demonstrate hazard mechanics
 # ================================================================
+env = MazeEnvironment("training")
+
 demo_fire_rotation(env, hazards_dict)
 navigate_to_hazard(env, env.matrix, env.start_mat, DEATH_PIT)
 navigate_to_hazard(env, env.matrix, env.start_mat, CONFUSION)
 navigate_to_hazard(env, env.matrix, env.start_mat, TELEPORT)
+
 
 # ================================================================
 # Episode loop
