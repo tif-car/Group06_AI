@@ -63,16 +63,8 @@ class TurnResult:
 # ================================================================
 # Popup helper
 # ================================================================
-def popup_image(path, title):
-    """
-    Try to open an image popup with a readable title.
-    Some OS image viewers ignore the title argument and show the filename instead.
-    """
-    img = Image.open(path)
-    try:
-        img.show(title=title)
-    except TypeError:
-        img.show()
+def popup_image(path, title=None):
+    Image.open(path).show()
 
 
 # ================================================================
@@ -122,11 +114,6 @@ def detect_hazards(image_path):
     """
     Scan every cell for a coloured marker by sampling a 9x9 pixel window
     around the cell centre. Returns {(row64, col64): cell_type}.
-
-    Heuristic:
-      - green / purple -> TELEPORT
-      - yellow/orange with dark facial features -> CONFUSION
-      - remaining warm icons -> DEATH_PIT or TELEPORT depending on compactness
     """
     rgb = np.array(Image.open(image_path).convert("RGB"))
     hazards = {}
@@ -163,7 +150,6 @@ def detect_hazards(image_path):
             hue_span = max(hues) - min(hues)
             dark_ratio = dark_pixels / 81.0
 
-            # green / purple -> teleports
             if 0.25 <= avg_h <= 0.45:
                 hazards[(r, c)] = TELEPORT
                 continue
@@ -172,12 +158,10 @@ def detect_hazards(image_path):
                 hazards[(r, c)] = TELEPORT
                 continue
 
-            # orange/yellow with dark facial features -> confusion
             if dark_ratio > 0.12 and npix >= 18:
                 hazards[(r, c)] = CONFUSION
                 continue
 
-            # remaining warm icons
             if npix >= 26 and hue_span < 0.12 and avg_v > 0.65 and avg_s > 0.40:
                 hazards[(r, c)] = TELEPORT
             else:
@@ -458,9 +442,6 @@ def save_solution_image(image_path, solution, out_path):
 
 
 def _icon_mask_for_patch(patch_rgb):
-    """
-    Keep saturated colored pixels, which correspond to the hazard artwork.
-    """
     h, w, _ = patch_rgb.shape
     mask = np.zeros((h, w), dtype=bool)
 
@@ -475,10 +456,6 @@ def _icon_mask_for_patch(patch_rgb):
 
 
 def _extract_icon_patch(src_img, x, y, crop_size=14):
-    """
-    Extract a transparent patch containing only the icon artwork from one cell.
-    x, y are 64x64 maze cell coordinates.
-    """
     half = crop_size // 2
     cx = BORDER + x * STRIDE + CELL_SIZE // 2
     cy = BORDER + y * STRIDE + CELL_SIZE // 2
@@ -500,16 +477,26 @@ def _extract_icon_patch(src_img, x, y, crop_size=14):
 
 
 def _paste_icon_patch(base_img, patch, x, y, crop_size=14):
-    """
-    Paste a transparent icon patch into the same maze cell.
-    x, y are 64x64 maze cell coordinates.
-    """
     half = crop_size // 2
     cx = BORDER + x * STRIDE + CELL_SIZE // 2
     cy = BORDER + y * STRIDE + CELL_SIZE // 2
     left = max(0, cx - half)
     top = max(0, cy - half)
     base_img.alpha_composite(patch, dest=(left, top))
+
+
+def save_hazards_from_matrix_image(clean_maze_path, hazard_maze_path, hazards_dict, out_path, crop_size=14):
+    """
+    Build MAZE_1_hazards.png from the clean maze using the hazards detected/stored in code.
+    """
+    base = Image.open(clean_maze_path).convert("RGBA")
+    src = Image.open(hazard_maze_path).convert("RGBA")
+
+    for (r, c), hazard_type in hazards_dict.items():
+        patch = _extract_icon_patch(src, c, r, crop_size=crop_size)
+        _paste_icon_patch(base, patch, c, r, crop_size=crop_size)
+
+    base.convert("RGB").save(out_path)
 
 
 def save_part5_rotated_in_place_image(clean_maze_path, hazard_maze_path, hazards_dict, fire_cells, rotation_degrees, out_path, crop_size=14):
@@ -521,22 +508,20 @@ def save_part5_rotated_in_place_image(clean_maze_path, hazard_maze_path, hazards
     base = Image.open(clean_maze_path).convert("RGBA")
     src = Image.open(hazard_maze_path).convert("RGBA")
 
-    # put back non-fire hazards exactly where they belong
     for (r, c), hazard_type in hazards_dict.items():
         if hazard_type != DEATH_PIT:
             patch = _extract_icon_patch(src, c, r, crop_size=crop_size)
             _paste_icon_patch(base, patch, c, r, crop_size=crop_size)
 
-    # put back fire hazards, but rotate each flame in place
     for (x, y) in fire_cells:
         flame_patch = _extract_icon_patch(src, x, y, crop_size=crop_size)
 
         if rotation_degrees == 90:
-            rotated_patch = flame_patch.transpose(Image.Transpose.ROTATE_270)
+            rotated_patch = flame_patch.rotate(-90, expand=True)
         elif rotation_degrees == 180:
-            rotated_patch = flame_patch.transpose(Image.Transpose.ROTATE_180)
+            rotated_patch = flame_patch.rotate(180, expand=True)
         elif rotation_degrees == 270:
-            rotated_patch = flame_patch.transpose(Image.Transpose.ROTATE_90)
+            rotated_patch = flame_patch.rotate(90, expand=True)
         else:
             rotated_patch = flame_patch.copy()
 
@@ -549,21 +534,23 @@ def save_part5_rotated_in_place_image(clean_maze_path, hazard_maze_path, hazards
 # 8. Helper demos
 # ================================================================
 def save_part5_image(env, hazards_dict):
+    out_path = "MAZE_1_part5.png"
     save_part5_rotated_in_place_image(
         "MAZE_0.png",
         env.image_path,
         hazards_dict,
         env.fire_cells,
         env.fire_rotation_degrees,
-        "MAZE_1_part5.png"
+        out_path
     )
+    return out_path
 
 
 def demo_fire_rotation(env, hazards_dict):
     env.reset()
-    env.step([Action.WAIT])  # rotate icons by 90 degrees in place
-    save_part5_image(env, hazards_dict)
-    popup_image("MAZE_1_part5.png", "MAZE 1 Part 5")
+    env.step([Action.WAIT])
+    out_path = save_part5_image(env, hazards_dict)
+    Image.open(out_path).show()
 
 
 def navigate_to_hazard(env, matrix, start_mat, target_type):
@@ -621,12 +608,15 @@ popup_image("MAZE_0_solved.png", "MAZE 0 Solved")
 # CHECKPOINT 2 — Load MAZE_1 with hazards
 # ================================================================
 hazards_dict = detect_hazards("MAZE_1.png")
-
 env = MazeEnvironment("training")
 
-# IMPORTANT: This uses the AI/code matrix, not a copy of the original image
-save_matrix_image(env.matrix, "MAZE_1_hazards.png")
-popup_image("MAZE_1_hazards.png", "MAZE 1 Hazards (Matrix)")
+save_hazards_from_matrix_image(
+    "MAZE_0.png",
+    "MAZE_1.png",
+    hazards_dict,
+    "MAZE_1_hazards.png"
+)
+popup_image("MAZE_1_hazards.png", "MAZE 1 Hazards")
 
 # ================================================================
 # CHECKPOINT 3 — Demonstrate hazard mechanics
