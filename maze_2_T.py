@@ -281,7 +281,6 @@ class MazeEnvironment:
                 if self.matrix[r, c] == DEATH_PIT:
                     self.fire_cells.add((c // 2, r // 2))
 
-        # fire remains in matrix as death cells, because it stays in the same position
         start, goal = find_start_and_goal(image)
 
         self.start_mat = start
@@ -306,9 +305,6 @@ class MazeEnvironment:
         return int(self.matrix[y * 2, x * 2])
 
     def rotate_fire_icon(self):
-        """
-        Fire does not move cells. The icon rotates in place.
-        """
         self.fire_rotation_degrees = (self.fire_rotation_degrees + 90) % 360
 
     def _try_move(self, action: Action, confused: bool):
@@ -387,7 +383,6 @@ class MazeEnvironment:
                 self.goal_reached = True
                 break
 
-        # rotate the fire icon after actions complete
         self.rotate_fire_icon()
 
         if not res.is_dead:
@@ -459,11 +454,6 @@ def save_solution_image(image_path, solution, out_path):
     for pos, color in [(solution[0], (0, 210, 0)), (solution[-1], (30, 100, 220))]:
         x, y = to_px(*pos)
         draw.ellipse([x - 7, y - 7, x + 7, y + 7], fill=color)
-    img.save(out_path)
-
-
-def save_exact_maze_copy(original_image_path, out_path):
-    img = Image.open(original_image_path).convert("RGB")
     img.save(out_path)
 
 
@@ -541,8 +531,14 @@ def save_part5_rotated_in_place_image(clean_maze_path, hazard_maze_path, hazards
     for (x, y) in fire_cells:
         flame_patch = _extract_icon_patch(src, x, y, crop_size=crop_size)
 
-        # PIL rotate uses counterclockwise for positive angles
-        rotated_patch = flame_patch.rotate(-rotation_degrees, expand=False)
+        if rotation_degrees == 90:
+            rotated_patch = flame_patch.transpose(Image.Transpose.ROTATE_270)
+        elif rotation_degrees == 180:
+            rotated_patch = flame_patch.transpose(Image.Transpose.ROTATE_180)
+        elif rotation_degrees == 270:
+            rotated_patch = flame_patch.transpose(Image.Transpose.ROTATE_90)
+        else:
+            rotated_patch = flame_patch.copy()
 
         _paste_icon_patch(base, rotated_patch, x, y, crop_size=crop_size)
 
@@ -627,8 +623,10 @@ popup_image("MAZE_0_solved.png", "MAZE 0 Solved")
 hazards_dict = detect_hazards("MAZE_1.png")
 
 env = MazeEnvironment("training")
-save_exact_maze_copy("MAZE_1.png", "MAZE_1_hazards.png")
-popup_image("MAZE_1_hazards.png", "MAZE 1 Hazards")
+
+# IMPORTANT: This uses the AI/code matrix, not a copy of the original image
+save_matrix_image(env.matrix, "MAZE_1_hazards.png")
+popup_image("MAZE_1_hazards.png", "MAZE 1 Hazards (Matrix)")
 
 # ================================================================
 # CHECKPOINT 3 — Demonstrate hazard mechanics
