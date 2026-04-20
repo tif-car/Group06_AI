@@ -155,7 +155,7 @@ class MazeEnvironment:
     def __init__(self, path):
         self.mat = load_maze(path)
         self.orbits = build_fire_orbits(self.mat)
-        self.start, self.goal = (32, 0), (32, 63)
+        self.start, self.goal = (13, 63), (32, 63)
         self.pos = self.start
         self.pending_respawn = False
 
@@ -404,5 +404,5 @@ class App:
 
 if __name__ == "__main__":
     environment = MazeEnvironment("mazepicUSE.png")
-    blind_agent = GAAgent(start=(32, 0), goal=(32, 63))
+    blind_agent = GAAgent(start=(13, 63), goal=(32, 63))
     App(environment, blind_agent)
