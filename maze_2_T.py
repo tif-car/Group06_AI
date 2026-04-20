@@ -1,46 +1,13 @@
-from PIL import Image, ImageDraw
+from PIL import Image
 import numpy as np
-from collections import deque
-import colorsys
-from typing import List
+import math, random, colorsys, threading, time
+import tkinter as tk
 from enum import Enum
-import math
-
-# ================================================================
-# Constants
-# ================================================================
-BORDER = 2
-CELL_SIZE = 14
-STRIDE = 16
-NUM_CELLS = 64
-MAT_SIZE = 128
-
-# Matrix codes
-EMPTY, WALL, START, GOAL, DEATH_PIT, TELEPORT, CONFUSION = 0, 1, 2, 3, 4, 5, 6
-
-CELL_NAMES = {
-    EMPTY: "Empty",
-    WALL: "Wall",
-    START: "Start",
-    GOAL: "Goal",
-    DEATH_PIT: "Death Pit",
-    TELEPORT: "Teleport",
-    CONFUSION: "Confusion",
-}
-
-CELL_COLORS = {
-    EMPTY: (255, 255, 255),
-    WALL: (0, 0, 0),
-    START: (0, 200, 0),
-    GOAL: (30, 100, 220),
-    DEATH_PIT: (220, 50, 0),
-    TELEPORT: (0, 190, 190),
-    CONFUSION: (160, 0, 200),
-}
+from typing import List, Tuple
 
 
 # ================================================================
-# Basic classes
+# 1. Official API Specifications (From Document Section 6)
 # ================================================================
 class Action(Enum):
     MOVE_UP = 0
@@ -52,649 +19,390 @@ class Action(Enum):
 
 class TurnResult:
     def __init__(self):
-        self.wall_hits = 0
-        self.current_position = (0, 0)
-        self.is_dead = False
-        self.is_confused = False
-        self.is_goal_reached = False
-        self.teleported = False
-        self.actions_executed = 0
-
-    def __repr__(self):
-        return (
-            f"pos={self.current_position} dead={self.is_dead} "
-            f"goal={self.is_goal_reached} confused={self.is_confused} "
-            f"teleported={self.teleported} wall_hits={self.wall_hits} "
-            f"actions_executed={self.actions_executed}"
-        )
+        self.wall_hits: int = 0
+        self.current_position: Tuple[int, int] = (0, 0)
+        self.is_dead: bool = False
+        self.is_confused: bool = False
+        self.is_goal_reached: bool = False
+        self.teleported: bool = False
+        self.actions_executed: int = 0
 
 
-# ================================================================
-# Small helper
-# ================================================================
-def popup_image(path):
-    Image.open(path).show()
+class Agent:
+    """Base class for student implementations"""
+
+    def __init__(self):
+        self.memory = {}
+
+    def plan_turn(self, last_result: TurnResult) -> List[Action]:
+        raise NotImplementedError("Students must implement this method")
+
+    def reset_episode(self):
+        pass
 
 
 # ================================================================
-# 1. Convert MAZE_0 image into matrix data
+# Configuration & Constants
 # ================================================================
-def _wall_below(gray, row, col):
-    y = BORDER + row * STRIDE + CELL_SIZE
-    x = BORDER + col * STRIDE + CELL_SIZE // 2
-    return not (gray[y, x] > 128 and gray[y + 1, x] > 128)
+BORDER, CELL_SIZE, STRIDE, NUM_CELLS, MAT_SIZE = 2, 14, 16, 64, 128
+EMPTY, WALL, DEATH_PIT, T_GREEN, T_YELLOW, T_PURPLE, CONFUSION = 0, 1, 4, 7, 8, 9, 6
+FIRE = 10
 
 
-def _wall_right(gray, row, col):
-    y = BORDER + row * STRIDE + CELL_SIZE // 2
-    x = BORDER + col * STRIDE + CELL_SIZE
-    return not (gray[y, x] > 128 and gray[y, x + 1] > 128)
-
-
-def load_maze(image_path):
-    """
-    Build the maze matrix from the clean maze image.
-    Real cells are at even-even coordinates.
-    The spaces between them store walls/passages.
-    """
-    gray = np.array(Image.open(image_path).convert("L"))
-    matrix = np.ones((MAT_SIZE, MAT_SIZE), dtype=np.uint8)
+# ================================================================
+# 2. Image Loading & Robust Hazard Detection
+# ================================================================
+def load_maze(path):
+    img = Image.open(path)
+    gray = np.array(img.convert("L"))
+    rgb = np.array(img.convert("RGB"))
+    mat = np.zeros((MAT_SIZE, MAT_SIZE), dtype=np.uint8)
 
     for r in range(NUM_CELLS):
         for c in range(NUM_CELLS):
-            matrix[r * 2, c * 2] = EMPTY
+            if r < 63: mat[r * 2 + 1, c * 2] = WALL if gray[
+                                                           BORDER + r * STRIDE + CELL_SIZE, BORDER + c * STRIDE + CELL_SIZE // 2] < 128 else EMPTY
+            if c < 63: mat[r * 2, c * 2 + 1] = WALL if gray[
+                                                           BORDER + r * STRIDE + CELL_SIZE // 2, BORDER + c * STRIDE + CELL_SIZE] < 128 else EMPTY
+            if r < 63 and c < 63: mat[r * 2 + 1, c * 2 + 1] = WALL
 
-            if r < NUM_CELLS - 1:
-                matrix[r * 2 + 1, c * 2] = WALL if _wall_below(gray, r, c) else EMPTY
-
-            if c < NUM_CELLS - 1:
-                matrix[r * 2, c * 2 + 1] = WALL if _wall_right(gray, r, c) else EMPTY
-
-            if r < NUM_CELLS - 1 and c < NUM_CELLS - 1:
-                matrix[r * 2 + 1, c * 2 + 1] = WALL
-
-    return matrix
-
-
-# ================================================================
-# 2. Detect hazards from MAZE_1 image
-# ================================================================
-def detect_hazards(image_path):
-    """
-    Returns:
-        {(row64, col64): hazard_type}
-    using 64x64 maze cell coordinates.
-    """
-    rgb = np.array(Image.open(image_path).convert("RGB"))
-    hazards = {}
-
-    for r in range(NUM_CELLS):
-        for c in range(NUM_CELLS):
-            cy = BORDER + r * STRIDE + CELL_SIZE // 2
-            cx = BORDER + c * STRIDE + CELL_SIZE // 2
-
-            colored = []
-            dark_pixels = 0
-
+            cy, cx = BORDER + r * STRIDE + CELL_SIZE // 2, BORDER + c * STRIDE + CELL_SIZE // 2
+            hues = []
             for dy in range(-4, 5):
                 for dx in range(-4, 5):
-                    y, x = cy + dy, cx + dx
-                    if 0 <= y < rgb.shape[0] and 0 <= x < rgb.shape[1]:
-                        rr, gg, bb = rgb[y, x]
-                        h, s, v = colorsys.rgb_to_hsv(rr / 255, gg / 255, bb / 255)
+                    rr, gg, bb = rgb[cy + dy, cx + dx]
+                    h, s, v = colorsys.rgb_to_hsv(rr / 255, gg / 255, bb / 255)
+                    if s > 0.3 and v > 0.3: hues.append(h)
 
-                        if s > 0.28 and v > 0.25:
-                            colored.append((h, s, v, rr, gg, bb))
-
-                        if rr < 95 and gg < 95 and bb < 95:
-                            dark_pixels += 1
-
-            if not colored:
-                continue
-
-            hues = [p[0] for p in colored]
-            avg_h = sum(p[0] for p in colored) / len(colored)
-            avg_s = sum(p[1] for p in colored) / len(colored)
-            avg_v = sum(p[2] for p in colored) / len(colored)
-            npix = len(colored)
-            hue_span = max(hues) - min(hues)
-            dark_ratio = dark_pixels / 81.0
-
-            # Green / cyan-ish = teleport
-            if 0.25 <= avg_h <= 0.45:
-                hazards[(r, c)] = TELEPORT
-                continue
-
-            # Purple-ish = confusion
-            if 0.72 <= avg_h <= 0.90:
-                hazards[(r, c)] = CONFUSION
-                continue
-
-            # Dark + colored icon also likely confusion
-            if dark_ratio > 0.12 and npix >= 18:
-                hazards[(r, c)] = CONFUSION
-                continue
-
-            # Very bright, tight color grouping can still be teleport
-            if npix >= 26 and hue_span < 0.12 and avg_v > 0.65 and avg_s > 0.40:
-                hazards[(r, c)] = TELEPORT
-            else:
-                hazards[(r, c)] = DEATH_PIT
-
-    return hazards
+            if hues:
+                avg_h = sum(hues) / len(hues)
+                if 0.12 <= avg_h <= 0.22:
+                    hz = T_YELLOW
+                elif 0.25 <= avg_h <= 0.45:
+                    hz = T_GREEN
+                elif 0.70 <= avg_h <= 0.90:
+                    hz = T_PURPLE
+                else:
+                    hz = DEATH_PIT
+                mat[r * 2, c * 2] = hz
+    return mat
 
 
 # ================================================================
-# 3. Merge hazards into the matrix
+# 3. Fire Orbit Logic (Exact Pixels, TRUE Clockwise)
 # ================================================================
-def merge_hazards_into_matrix(base_matrix, hazards_dict):
-    merged = base_matrix.copy()
+def build_fire_orbits(mat):
+    fires = [(c, r) for r in range(0, MAT_SIZE, 2) for c in range(0, MAT_SIZE, 2) if mat[r, c] == DEATH_PIT]
+    clusters = []
 
-    for (r, c), hazard_type in hazards_dict.items():
-        merged[r * 2, c * 2] = hazard_type
+    for fx, fy in fires:
+        placed = False
+        for cl in clusters:
+            if any(math.hypot(fx - px, fy - py) <= 8 for px, py in cl["pts"]):
+                cl["pts"].append((fx, fy))
+                placed = True;
+                break
+        if not placed: clusters.append({"pts": [(fx, fy)]})
 
-    return merged
+    orbits = []
+    for cl in clusters:
+        pts = cl["pts"]
+        if len(pts) <= 2:
+            px, py = pts[0]
+        else:
+            max_d = -1
+            t1, t2 = pts[0], pts[0]
+            for p1 in pts:
+                for p2 in pts:
+                    d = math.hypot(p1[0] - p2[0], p1[1] - p2[1])
+                    if d > max_d: max_d = d; t1, t2 = p1, p2
 
+            pivot = max(pts,
+                        key=lambda p: math.hypot(p[0] - t1[0], p[1] - t1[1]) + math.hypot(p[0] - t2[0], p[1] - t2[1]))
+            px, py = pivot
 
-def build_hazard_maze_matrix(base_maze_path, hazard_maze_path):
-    base_matrix = load_maze(base_maze_path)
-    hazards_dict = detect_hazards(hazard_maze_path)
-    merged_matrix = merge_hazards_into_matrix(base_matrix, hazards_dict)
-    return merged_matrix, hazards_dict
+        mems = [(x - px, y - py) for x, y in pts]
 
+        # Replace original DEATH_PIT with FIRE in the environment matrix
+        for x, y in pts:
+            mat[y, x] = FIRE
 
-# ================================================================
-# 4. Find start and goal
-# ================================================================
-def find_start_and_goal(image_path):
-    gray = np.array(Image.open(image_path).convert("L"))
-
-    top = [c for c in range(gray.shape[1]) if gray[1, c] > 128]
-    bottom = [c for c in range(gray.shape[1]) if gray[-2, c] > 128]
-
-    tc = ((top[len(top) // 2] - BORDER) // STRIDE) * 2
-    bc = ((bottom[len(bottom) // 2] - BORDER) // STRIDE) * 2
-
-    return (0, tc), (NUM_CELLS * 2 - 2, bc)
-
-
-# ================================================================
-# 5. BFS solver
-# ================================================================
-def solve(matrix, start, goal, blocked=None):
-    if blocked is None:
-        blocked = {WALL}
-
-    queue = deque([start])
-    came_from = {start: None}
-
-    while queue:
-        cur = queue.popleft()
-
-        if cur == goal:
-            path = []
-            node = cur
-            while node is not None:
-                path.append(node)
-                node = came_from[node]
-            return path[::-1]
-
-        r, c = cur
-        for nr, nc in [(r - 1, c), (r + 1, c), (r, c - 1), (r, c + 1)]:
-            if (
-                0 <= nr < MAT_SIZE
-                and 0 <= nc < MAT_SIZE
-                and (nr, nc) not in came_from
-                and matrix[nr, nc] not in blocked
-            ):
-                came_from[(nr, nc)] = cur
-                queue.append((nr, nc))
-
-    return None
+        orbits.append({"px": px, "py": py, "mems": mems})
+    return orbits
 
 
-def path_to_actions(path) -> List[Action]:
-    cells = [(r, c) for r, c in path if r % 2 == 0 and c % 2 == 0]
+def rotate_fires(mat, orbits):
+    for r in range(0, MAT_SIZE, 2):
+        for c in range(0, MAT_SIZE, 2):
+            if mat[r, c] == FIRE: mat[r, c] = EMPTY
 
-    deltas = {
-        (-2, 0): Action.MOVE_UP,
-        (2, 0): Action.MOVE_DOWN,
-        (0, -2): Action.MOVE_LEFT,
-        (0, 2): Action.MOVE_RIGHT,
-    }
-
-    actions = []
-    for (r1, c1), (r2, c2) in zip(cells, cells[1:]):
-        dr = r2 - r1
-        dc = c2 - c1
-        if (dr, dc) in deltas:
-            actions.append(deltas[(dr, dc)])
-
-    return actions
+    # TRUE CW Rotation Sequence: V -> > -> ^ -> <
+    for o in orbits:
+        new_mems = []
+        for dx, dy in o["mems"]:
+            nx, ny = dy, -dx  # Clockwise
+            new_mems.append((nx, ny))
+            fx, fy = o["px"] + nx, o["py"] + ny
+            if 0 <= fx < MAT_SIZE and 0 <= fy < MAT_SIZE:
+                mat[int(fy), int(fx)] = FIRE
+        o["mems"] = new_mems
 
 
 # ================================================================
-# 6. Draw matrix back into image
-# ================================================================
-def save_matrix_image(matrix, out_path, scale=8, solution=None):
-    size = MAT_SIZE * scale
-    img = Image.new("RGB", (size, size))
-    draw = ImageDraw.Draw(img)
-
-    for r in range(MAT_SIZE):
-        for c in range(MAT_SIZE):
-            val = int(matrix[r, c])
-            color = CELL_COLORS.get(val, (255, 0, 255))
-            draw.rectangle(
-                [c * scale, r * scale, c * scale + scale - 1, r * scale + scale - 1],
-                fill=color
-            )
-
-    if solution:
-        dot = max(2, scale // 3)
-        for r, c in solution:
-            cx = c * scale + scale // 2
-            cy = r * scale + scale // 2
-            draw.ellipse([cx - dot, cy - dot, cx + dot, cy + dot], fill=(255, 255, 0))
-
-    img.save(out_path)
-
-
-def save_matrix_image_with_labels(matrix, out_path, scale=8):
-    start, goal = find_start_and_goal("MAZE_0.png")
-    matrix_copy = matrix.copy()
-    matrix_copy[start[0], start[1]] = START
-    matrix_copy[goal[0], goal[1]] = GOAL
-    save_matrix_image(matrix_copy, out_path, scale=scale)
-
-
-def save_solution_image_on_original(image_path, solution, out_path):
-    img = Image.open(image_path).convert("RGB")
-    draw = ImageDraw.Draw(img)
-
-    def to_px(r, c):
-        return (
-            BORDER + (c / 2) * STRIDE + CELL_SIZE / 2,
-            BORDER + (r / 2) * STRIDE + CELL_SIZE / 2
-        )
-
-    draw.line([to_px(r, c) for r, c in solution], fill=(220, 50, 50), width=3)
-
-    for pos, color in [(solution[0], (0, 210, 0)), (solution[-1], (30, 100, 220))]:
-        x, y = to_px(*pos)
-        draw.ellipse([x - 7, y - 7, x + 7, y + 7], fill=color)
-
-    img.save(out_path)
-
-
-# ================================================================
-# 7. Build teleport map
-# ================================================================
-def build_teleport_map(matrix):
-    """
-    Temporary deterministic pairing for check-in demo.
-    Pairs teleports in scan order.
-    """
-    pads = [
-        (r, c)
-        for r in range(0, MAT_SIZE, 2)
-        for c in range(0, MAT_SIZE, 2)
-        if matrix[r, c] == TELEPORT
-    ]
-
-    mapping = {}
-    for i in range(0, len(pads), 2):
-        if i + 1 < len(pads):
-            mapping[pads[i]] = pads[i + 1]
-            mapping[pads[i + 1]] = pads[i]
-
-    return mapping
-
-
-# ================================================================
-# 8. Environment uses the matrix directly
+# 4. Compliant Maze Environment
 # ================================================================
 class MazeEnvironment:
-    def __init__(self, maze_id: str):
-        if maze_id == "training":
-            base_image = "MAZE_0.png"
-            hazard_image = "MAZE_1.png"
-        else:
-            raise ValueError(f"Unknown maze_id: {maze_id}")
+    def __init__(self, path):
+        self.mat = load_maze(path)
+        self.orbits = build_fire_orbits(self.mat)
+        self.start, self.goal = (32, 0), (32, 63)
+        self.pos = self.start
+        self.pending_respawn = False
 
-        self.base_image_path = base_image
-        self.hazard_image_path = hazard_image
-
-        self.matrix, self.hazards_dict = build_hazard_maze_matrix(base_image, hazard_image)
-
-        self.start_mat, self.goal_mat = find_start_and_goal(base_image)
-        self.teleport_map = build_teleport_map(self.matrix)
-
-        self.start_xy = (self.start_mat[1] // 2, self.start_mat[0] // 2)
-        self.goal_xy = (self.goal_mat[1] // 2, self.goal_mat[0] // 2)
-
-        self.fire_cells = set()
-        for r in range(0, MAT_SIZE, 2):
-            for c in range(0, MAT_SIZE, 2):
-                if self.matrix[r, c] == DEATH_PIT:
-                    self.fire_cells.add((c // 2, r // 2))
-
-        self.reset()
-
-    def reset(self):
-        self.pos = self.start_xy
-        self.confused_left = 0
-        self.turns = 0
-        self.deaths = 0
-        self.confused_hits = 0
-        self.explored = set()
-        self.goal_reached = False
-        self.fire_rotation_degrees = 0
+    def reset(self) -> Tuple[int, int]:
+        self.pos = self.start
         self.pending_respawn = False
         return self.pos
 
-    def _cell_type(self, x, y):
-        return int(self.matrix[y * 2, x * 2])
-
-    def rotate_fire_icon(self):
-        self.fire_rotation_degrees = (self.fire_rotation_degrees + 90) % 360
-
-    def _try_move(self, action: Action, confused: bool):
-        dx, dy = {
-            Action.MOVE_UP: (0, -1),
-            Action.MOVE_DOWN: (0, 1),
-            Action.MOVE_LEFT: (-1, 0),
-            Action.MOVE_RIGHT: (1, 0),
-            Action.WAIT: (0, 0),
-        }[action]
-
-        if confused and action != Action.WAIT:
-            dx, dy = -dx, -dy
-
-        x, y = self.pos
-        nx, ny = x + dx, y + dy
-
-        if not (0 <= nx < NUM_CELLS and 0 <= ny < NUM_CELLS):
-            return x, y, True
-
-        if self.matrix[y * 2 + dy, x * 2 + dx] == WALL:
-            return x, y, True
-
-        return nx, ny, False
-
     def step(self, actions: List[Action]) -> TurnResult:
-        if not actions or len(actions) > 5:
-            raise ValueError("Need 1-5 actions per turn.")
-
-        # Respawn at start on next turn after dying
-        if self.pending_respawn:
-            self.pos = self.start_xy
-            self.pending_respawn = False
-
         res = TurnResult()
 
-        turn_confused = self.confused_left > 0
-        if turn_confused:
-            self.confused_left -= 1
-            res.is_confused = True
+        if self.pending_respawn:
+            self.pos = self.start
+            self.pending_respawn = False
 
-        got_confused = False
-
-        for action in actions:
-            nx, ny, wall_hit = self._try_move(action, turn_confused or got_confused)
-
-            if wall_hit:
-                res.wall_hits += 1
+        for act in actions:
+            if act == Action.WAIT:
                 res.actions_executed += 1
                 continue
 
-            self.pos = (nx, ny)
-            self.explored.add(self.pos)
+            dx, dy = \
+            {Action.MOVE_UP: (0, -1), Action.MOVE_DOWN: (0, 1), Action.MOVE_LEFT: (-1, 0), Action.MOVE_RIGHT: (1, 0)}[
+                act]
+            nx, ny = self.pos[0] + dx, self.pos[1] + dy
+
+            if 0 <= nx < 64 and 0 <= ny < 64:
+                if self.mat[self.pos[1] * 2 + dy, self.pos[0] * 2 + dx] == WALL:
+                    res.wall_hits += 1
+                else:
+                    self.pos = (nx, ny)
+                    hz = self.mat[ny * 2, nx * 2]
+                    if hz == DEATH_PIT or hz == FIRE:
+                        res.is_dead = True
+                        res.actions_executed += 1
+                        res.current_position = (nx, ny)
+                        self.pending_respawn = True
+                        break
+
+                    if self.pos == self.goal:
+                        res.is_goal_reached = True
+                        res.actions_executed += 1
+                        res.current_position = self.pos
+                        break
+            else:
+                res.wall_hits += 1
             res.actions_executed += 1
 
-            cell = self._cell_type(nx, ny)
-
-            if cell == DEATH_PIT:
-                res.is_dead = True
-                res.current_position = (nx, ny)
-                self.deaths += 1
-                self.pending_respawn = True
-                break
-
-            if cell == TELEPORT:
-                key = (ny * 2, nx * 2)
-                if cell == TELEPORT:
-                    key = (ny * 2, nx * 2)
-
-                    if key in self.teleport_map:
-                        dst = self.teleport_map[key]
-                        self.pos = (dst[1] // 2, dst[0] // 2)
-                        res.teleported = True
-
-            elif cell == CONFUSION:
-                if not got_confused:
-                    got_confused = True
-                    self.confused_left = 1
-                    res.is_confused = True
-                    self.confused_hits += 1
-
-            if self.pos == self.goal_xy:
-                res.is_goal_reached = True
-                self.goal_reached = True
-                break
-
-        self.rotate_fire_icon()
-
-        if not res.is_dead:
+        if not res.is_dead and not res.is_goal_reached:
             res.current_position = self.pos
 
-        self.turns += 1
+        rotate_fires(self.mat, self.orbits)
         return res
 
 
 # ================================================================
-# 9. Matrix-based Part 5 image
+# 5. GA Solver & Blind Agent Implementation
 # ================================================================
-def save_part5_from_matrix(matrix, fire_cells, rotation_degrees, out_path, scale=8):
-    size = MAT_SIZE * scale
-    img = Image.new("RGB", (size, size))
-    draw = ImageDraw.Draw(img)
-
-    for r in range(MAT_SIZE):
-        for c in range(MAT_SIZE):
-            val = int(matrix[r, c])
-            color = CELL_COLORS.get(val, (255, 0, 255))
-            draw.rectangle(
-                [c * scale, r * scale, c * scale + scale - 1, r * scale + scale - 1],
-                fill=color
-            )
-
-    angle = math.radians(rotation_degrees)
-    line_len = max(3, scale)
-
-    for (x, y) in fire_cells:
-        mr = y * 2
-        mc = x * 2
-
-        cx = mc * scale + scale // 2
-        cy = mr * scale + scale // 2
-
-        dx = int(line_len * math.cos(angle))
-        dy = int(line_len * math.sin(angle))
-
-        draw.line([cx, cy, cx + dx, cy + dy], fill=(255, 255, 0), width=2)
-
-        dot = max(2, scale // 3)
-        draw.ellipse([cx - dot, cy - dot, cx + dot, cy + dot], fill=(255, 255, 0))
-
-    img.save(out_path)
+GA_POP, GA_GENS, GA_LEN = 100, 20, 60
 
 
-# ================================================================
-# 10. Hazard debug helpers
-# ================================================================
-def print_hazards(hazards_dict):
-    counts = {DEATH_PIT: 0, TELEPORT: 0, CONFUSION: 0}
-    for h in hazards_dict.values():
-        if h in counts:
-            counts[h] += 1
-
-    print("Hazard counts:")
-    print("Death pits:", counts[DEATH_PIT])
-    print("Teleports :", counts[TELEPORT])
-    print("Confusion :", counts[CONFUSION])
-
-
-def demo_hazard_cells(env):
-    print("\nSample hazards detected:")
-    shown = 0
-    for (r, c), h in env.hazards_dict.items():
-        print(f"Cell ({r}, {c}) -> {CELL_NAMES[h]}")
-        shown += 1
-        if shown >= 10:
-            break
-
-
-def find_open_neighbor_for_hazard(matrix, hr, hc):
-    """
-    Given a hazard at 64x64 cell coords (hr, hc),
-    find an adjacent open cell and the action needed to step into hazard.
-    """
-    options = [
-        (hr - 1, hc, Action.MOVE_DOWN),
-        (hr + 1, hc, Action.MOVE_UP),
-        (hr, hc - 1, Action.MOVE_RIGHT),
-        (hr, hc + 1, Action.MOVE_LEFT),
-    ]
-
-    for nr, nc, action in options:
-        if 0 <= nr < NUM_CELLS and 0 <= nc < NUM_CELLS:
-            if matrix[nr * 2, nc * 2] == EMPTY:
-                # wall between neighbor and hazard must be open
-                dy = hr - nr
-                dx = hc - nc
-                if matrix[nr * 2 + dy, nc * 2 + dx] != WALL:
-                    return (nc, nr), action
-
-    return None, None
-
-
-def demo_specific_hazard(env, hazard_type):
-    for (hr, hc), h in env.hazards_dict.items():
-        if h != hazard_type:
+def simulate(mat, start, goal, chrom, heatmap):
+    x, y = start
+    path = [(x, y)]
+    visited = {(x, y)}
+    pen = 0
+    for move in chrom:
+        if move == Action.WAIT:
+            pen += 100  # Increased wait penalty
             continue
+        dx, dy = \
+        {Action.MOVE_UP: (0, -1), Action.MOVE_DOWN: (0, 1), Action.MOVE_LEFT: (-1, 0), Action.MOVE_RIGHT: (1, 0)}[move]
+        nx, ny = x + dx, y + dy
+        if 0 <= nx < 64 and 0 <= ny < 64:
+            if mat[y * 2 + dy, x * 2 + dx] != WALL:
+                x, y = nx, ny
+                path.append((x, y))
 
-        start_pos, action = find_open_neighbor_for_hazard(env.matrix, hr, hc)
-        if start_pos is None:
-            continue
+                if (x, y) in visited:
+                    pen += 200
+                visited.add((x, y))
 
-        env.pos = start_pos
-        env.pending_respawn = False
-        env.confused_left = 0
+                # BOREDOM PENALTY: Drastically increased to force exploration over cowering
+                pen += heatmap[y, x] * 200
 
-        print(f"\nTesting {CELL_NAMES[hazard_type]} at cell ({hr}, {hc})")
-        print("Agent starting at:", env.pos)
-        print("Action:", action.name)
+                hz = mat[y * 2, x * 2]
+                if hz == DEATH_PIT:
+                    pen += 2000  # INSTANT BREAK
+                    break
+                elif hz == FIRE:
+                    pen += 100  # DRASTICALLY REDUCED. Agent is willing to risk it now.
 
-        result = env.step([action])
-        print("Result:", result)
-        print("Agent end pos:", env.pos)
-        return
+                if (x, y) == goal:
+                    pen -= 5000  # MASSIVE BONUS for reaching goal
+                    break
+            else:
+                pen += 20
 
-    print(f"\nNo reachable {CELL_NAMES[hazard_type]} found for demo.")
+    dist_to_goal = abs(x - goal[0]) + abs(y - goal[1])
+    dist_from_start = abs(x - start[0]) + abs(y - start[1])
+
+    # DRASTICALLY increased goal gravity
+    score = (dist_to_goal * 50.0) - (dist_from_start * 10.0) + pen
+    return score, path
 
 
-def demo_wall_hit(env):
-    x, y = env.start_xy
-    env.pos = (x, y)
-    env.pending_respawn = False
-    env.confused_left = 0
+def solve(mat, start, goal, heatmap):
+    valid_moves = [Action.MOVE_UP, Action.MOVE_DOWN, Action.MOVE_LEFT, Action.MOVE_RIGHT, Action.WAIT]
+    pop = [[random.choice(valid_moves) for _ in range(GA_LEN)] for _ in range(GA_POP)]
+    best_chrom, best_score = pop[0], float('inf')
 
-    # Try several directions until one hits a wall
-    for action in [Action.MOVE_LEFT, Action.MOVE_RIGHT, Action.MOVE_UP, Action.MOVE_DOWN]:
-        env.pos = (x, y)
-        result = env.step([action])
-        if result.wall_hits > 0:
-            print("\nTesting wall behavior")
-            print("Start:", (x, y))
-            print("Action:", action.name)
-            print("Result:", result)
-            return
+    for gen in range(GA_GENS):
+        scored = sorted([(c, simulate(mat, start, goal, c, heatmap)[0]) for c in pop], key=lambda x: x[1])
+        if scored[0][1] < best_score:
+            best_chrom, best_score = scored[0]
 
-    print("\nCould not demonstrate wall hit from start cell.")
+        new_pop = [c for c, s in scored[:10]]
+        while len(new_pop) < GA_POP:
+            p1, p2 = random.choice(scored[:20])[0], random.choice(scored[:20])[0]
+            cp = random.randint(1, GA_LEN - 1)
+            child = p1[:cp] + p2[cp:]
+            if random.random() < 0.1: child[random.randint(0, GA_LEN - 1)] = random.choice(valid_moves)
+            new_pop.append(child)
+        pop = new_pop
+    return best_chrom
+
+
+class GAAgent(Agent):
+    def __init__(self, start, goal):
+        super().__init__()
+        self.start = start
+        self.goal = goal
+        self.known_mat = np.zeros((MAT_SIZE, MAT_SIZE), dtype=np.uint8)
+        self.heatmap = np.zeros((64, 64), dtype=int)
+        self.pos = start
+        self.queue = []
+        self.last_act = None
+        self.was_fire_target = False
+
+    def plan_turn(self, last_result: TurnResult) -> List[Action]:
+        if last_result:
+            if last_result.is_dead:
+                dx, dy = last_result.current_position
+                if not self.was_fire_target:
+                    self.known_mat[dy * 2, dx * 2] = DEATH_PIT
+                self.pos = self.start
+                self.queue.clear()
+            else:
+                if last_result.wall_hits > 0 and self.last_act and self.last_act != Action.WAIT:
+                    dx, dy = {Action.MOVE_UP: (0, -1), Action.MOVE_DOWN: (0, 1), Action.MOVE_LEFT: (-1, 0),
+                              Action.MOVE_RIGHT: (1, 0)}[self.last_act]
+                    self.known_mat[self.pos[1] * 2 + dy, self.pos[0] * 2 + dx] = WALL
+                    self.queue.clear()
+                else:
+                    self.pos = last_result.current_position
+
+        self.heatmap[self.pos[1], self.pos[0]] += 1
+
+        if not self.queue:
+            self.queue = solve(self.known_mat, self.pos, self.goal, self.heatmap)
+
+        act = self.queue.pop(0) if self.queue else Action.WAIT
+        self.last_act = act
+
+        if act != Action.WAIT:
+            dx, dy = \
+            {Action.MOVE_UP: (0, -1), Action.MOVE_DOWN: (0, 1), Action.MOVE_LEFT: (-1, 0), Action.MOVE_RIGHT: (1, 0)}[
+                act]
+            target_y, target_x = self.pos[1] + dy, self.pos[0] + dx
+            if 0 <= target_x < 64 and 0 <= target_y < 64:
+                self.was_fire_target = (self.known_mat[target_y * 2, target_x * 2] == FIRE)
+            else:
+                self.was_fire_target = False
+        else:
+            self.was_fire_target = (self.known_mat[self.pos[1] * 2, self.pos[0] * 2] == FIRE)
+
+        return [act]
 
 
 # ================================================================
-# 11. Main demo
+# 6. Visualizer App
 # ================================================================
+class App:
+    def __init__(self, env, agent):
+        self.env = env
+        self.agent = agent
+        self.root = tk.Tk()
+        self.root.title("GA Maze Solver - Blind Agent")
+        self.canvas = tk.Canvas(self.root, width=512, height=512, bg="white")
+        self.canvas.pack()
+        self.path = []
+        threading.Thread(target=self.loop, daemon=True).start()
+        self.draw()
+        self.root.mainloop()
+
+    def loop(self):
+        last_res = None
+        while True:
+            self.agent.known_mat[self.agent.known_mat == FIRE] = EMPTY
+            self.agent.known_mat[self.env.mat == FIRE] = FIRE
+
+            actions = self.agent.plan_turn(last_res)
+            last_res = self.env.step(actions)
+
+            self.path = \
+            simulate(self.agent.known_mat, self.agent.pos, self.agent.goal, self.agent.queue, self.agent.heatmap)[1]
+
+            if last_res.is_goal_reached:
+                print("Goal Reached!")
+                break
+
+            time.sleep(0.01)
+
+    def draw(self):
+        self.canvas.delete("all")
+        px = 8
+
+        for x, y in self.path:
+            self.canvas.create_rectangle(x * px, y * px, x * px + px, y * px + px, fill="#ffb3c6", outline="")
+
+        for r in range(NUM_CELLS):
+            for c in range(NUM_CELLS):
+                t = self.env.mat[r * 2, c * 2]
+                if t == DEATH_PIT:
+                    self.canvas.create_rectangle(c * px, r * px, c * px + px, r * px + px, fill="red", outline="")
+                elif t == FIRE:
+                    self.canvas.create_rectangle(c * px, r * px, c * px + px, r * px + px, fill="orange", outline="")
+                elif t == T_GREEN:
+                    self.canvas.create_rectangle(c * px, r * px, c * px + px, r * px + px, fill="green", outline="")
+                elif t == T_YELLOW:
+                    self.canvas.create_rectangle(c * px, r * px, c * px + px, r * px + px, fill="gold", outline="")
+                elif t == T_PURPLE:
+                    self.canvas.create_rectangle(c * px, r * px, c * px + px, r * px + px, fill="purple", outline="")
+
+                if r < 63 and self.env.mat[r * 2 + 1, c * 2] == WALL:
+                    self.canvas.create_line(c * px, r * px + px, c * px + px, r * px + px, fill="black", width=2)
+                if c < 63 and self.env.mat[r * 2, c * 2 + 1] == WALL:
+                    self.canvas.create_line(c * px + px, r * px, c * px + px, r * px + px, fill="black", width=2)
+
+        gx, gy = self.env.goal
+        self.canvas.create_oval(gx * px, gy * px, gx * px + px, gy * px + px, fill="blue")
+        ax, ay = self.env.pos
+        self.canvas.create_oval(ax * px + 1, ay * px + 1, ax * px + px - 1, ay * px + px - 1, fill="cyan")
+
+        self.root.after(100, self.draw)
+
+
 if __name__ == "__main__":
-    # A) Build base maze matrix from MAZE_0
-    matrix0 = load_maze("MAZE_0.png")
-
-    # B) Show teacher the base computation matrix
-    save_matrix_image_with_labels(matrix0, "MAZE_0_matrix.png", scale=8)
-
-    # C) Detect hazards from MAZE_1 and merge into matrix
-    matrix1, hazards_dict = build_hazard_maze_matrix("MAZE_0.png", "MAZE_1.png")
-    print_hazards(hazards_dict)
-
-    # D) Show teacher the final computation matrix with hazards
-    save_matrix_image_with_labels(matrix1, "MAZE_1_matrix_with_hazards.png", scale=8)
-
-    # E) Solve base maze with BFS
-    start0, goal0 = find_start_and_goal("MAZE_0.png")
-    print("\nStart:", start0, "Goal:", goal0)
-
-    path0 = solve(matrix0, start0, goal0, blocked={WALL})
-    if path0 is None:
-        print("No BFS path found.")
-    else:
-        print("BFS path length:", len(path0))
-
-        # F) Draw BFS path on matrix version
-        save_matrix_image(matrix0, "MAZE_0_matrix_with_solution.png", scale=8, solution=path0)
-
-        # G) Draw BFS path on original image too
-        save_solution_image_on_original("MAZE_0.png", path0, "MAZE_0_original_with_solution.png")
-
-    # H) Create environment from final computation matrix
-    env = MazeEnvironment("training")
-    demo_hazard_cells(env)
-
-    # I) Demonstrate hazard mechanics
-    demo_wall_hit(env)
-    demo_specific_hazard(env, DEATH_PIT)
-    demo_specific_hazard(env, TELEPORT)
-    demo_specific_hazard(env, CONFUSION)
-
-    # J) Show Part 5 directly from matrix
-    save_part5_from_matrix(
-        env.matrix,
-        env.fire_cells,
-        env.fire_rotation_degrees,
-        "MAZE_1_part5_from_matrix.png",
-        scale=8
-    )
-
-    # K) Open outputs
-    popup_image("MAZE_0_matrix.png")
-    popup_image("MAZE_1_matrix_with_hazards.png")
-    if path0 is not None:
-        popup_image("MAZE_0_matrix_with_solution.png")
-        popup_image("MAZE_0_original_with_solution.png")
-    popup_image("MAZE_1_part5_from_matrix.png")
-
-
-
-
-
-
-
-#!from here on is the old code
-
-
-
-
-
-
-
+    environment = MazeEnvironment("mazepicUSE.png")
+    blind_agent = GAAgent(start=(32, 0), goal=(32, 63))
+    App(environment, blind_agent)
