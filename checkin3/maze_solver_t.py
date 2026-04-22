@@ -47,6 +47,7 @@ ARROW_VEC = {
 ROT_OFF = [(0, -1), (1, 0), (0, 1), (-1, 0)]
 FIRE_PER = 5
 DIRS4 = [(1, 0), (-1, 0), (0, 1), (0, -1)]
+FIRE = 11
 
 
 class Action(Enum):
@@ -241,9 +242,10 @@ def detect_hazards(path):
 
 def assemble_map(hz, s, g):
     ct = {}
-    fires = set()
     tele = {}
     col = defaultdict(list)
+    fire_cells = set()
+    fire_pivots = set()
 
     amap = {
         "arrow_up": ARROW_UP,
@@ -252,10 +254,10 @@ def assemble_map(hz, s, g):
         "arrow_right": ARROW_RIGHT,
     }
 
+    # First pass
     for pos, cat in hz.items():
         if cat == "fire":
-            ct[pos] = DEATH_PIT
-            fires.add(pos)
+            fire_cells.add(pos)
         elif cat == "skull":
             ct[pos] = CONFUSION
         elif cat in amap:
@@ -263,6 +265,7 @@ def assemble_map(hz, s, g):
         elif cat not in ("start_marker",):
             col[cat].append(pos)
 
+    # Teleport colors from your hazard note
     teleport_colors = {"green", "yellow", "purple"}
 
     for color, cells in col.items():
@@ -274,12 +277,47 @@ def assemble_map(hz, s, g):
                 tele[a] = b
                 tele[b] = a
 
+    # Group fire cells into clusters using 8-neighbor connectivity
+    remaining = set(fire_cells)
+    fire_components = []
+    dirs8 = [
+        (1, 0), (-1, 0), (0, 1), (0, -1),
+        (1, 1), (1, -1), (-1, 1), (-1, -1)
+    ]
+
+    while remaining:
+        start = remaining.pop()
+        stack = [start]
+        comp = {start}
+
+        while stack:
+            x, y = stack.pop()
+            for dx, dy in dirs8:
+                nxt = (x + dx, y + dy)
+                if nxt in remaining:
+                    remaining.remove(nxt)
+                    stack.append(nxt)
+                    comp.add(nxt)
+
+        fire_components.append(comp)
+
+    # Pick one pivot per cluster: lowest y, middle x among tied lowest cells
+    for comp in fire_components:
+        max_y = max(y for x, y in comp)
+        bottom = sorted([p for p in comp if p[1] == max_y], key=lambda p: p[0])
+        pivot = bottom[len(bottom) // 2]
+        fire_pivots.add(pivot)
+
+        # mark fire cells only for rendering, not as static death
+        for p in comp:
+            ct[p] = FIRE
+
     ct[s] = START
     ct[g] = GOAL
-    fires.discard(s)
-    fires.discard(g)
+    fire_pivots.discard(s)
+    fire_pivots.discard(g)
 
-    return ct, tele, fires
+    return ct, tele, fire_pivots, fire_cells
 
 
 class MazeEnvironment:
@@ -317,7 +355,7 @@ class MazeEnvironment:
         # for k, v in sorted(raw_hz.items()):
         #     print(k, v)
 
-        self.cell_types, self.teleport_pairs, self.fire_pivots = assemble_map(
+        self.cell_types, self.teleport_pairs, self.fire_pivots, self.fire_cells = assemble_map(
             raw_hz, self.start_xy, self.goal_xy
         )
 
@@ -362,8 +400,11 @@ class MazeEnvironment:
         return (tx, ty) if 0 <= tx < NUM_CELLS and 0 <= ty < NUM_CELLS else None
 
     def _deadly(self, xy, ai):
-        ct = self.cell_types.get(xy, EMPTY)
-        return ct == DEATH_PIT and xy not in self.fire_pivots
+        # only rotating fire tip is deadly
+        for piv in self.fire_pivots:
+            if self._tip(piv, ai) == xy:
+                return True
+        return False
     
 
 
@@ -666,10 +707,15 @@ class DynaQAgent:
             dc = new
             self.death_cells.add(dc)
 
+            #if dc not in self.fire_adj:
+            #    self.danger[dc] = min(0.75, self.danger.get(dc, 0) + 0.12)
+            #else:
+            #    self.danger[dc] = min(0.60, self.danger.get(dc, 0) + 0.08)
+
             if dc not in self.fire_adj:
-                self.danger[dc] = min(0.75, self.danger.get(dc, 0) + 0.12)
+                self.danger[dc] = min(0.45, self.danger.get(dc, 0) + 0.08)
             else:
-                self.danger[dc] = min(0.60, self.danger.get(dc, 0) + 0.08)
+                self.danger[dc] = min(0.35, self.danger.get(dc, 0) + 0.05)
 
             for dx, dy in DIRS4:
                 nx, ny = dc[0] + dx, dc[1] + dy
@@ -865,7 +911,7 @@ class DynaQAgent:
                         break
 
                 if path is None:
-                    for thresh in [0.99, 0.85, 0.65]:
+                    for thresh in [1.5, 1.0, 0.7]:
                         path = self._bfs(
                             self.current_pos,
                             self.goal_xy,
@@ -1000,6 +1046,7 @@ COLORS = {
     ARROW_DOWN: (60, 140, 240),
     ARROW_LEFT: (60, 140, 240),
     ARROW_RIGHT: (60, 140, 240),
+    FIRE: (255, 140, 0),
 }
 
 
