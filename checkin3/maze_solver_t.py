@@ -257,18 +257,15 @@ def assemble_map(hz, s, g):
             ct[pos] = DEATH_PIT
             fires.add(pos)
         elif cat == "skull":
-            ct[pos] = DEATH_PIT
+            ct[pos] = CONFUSION
         elif cat in amap:
             ct[pos] = amap[cat]
         elif cat not in ("start_marker",):
             col[cat].append(pos)
 
-    # 🔥 REPLACE OLD LOGIC WITH THIS
-    teleport_colors = {"green", "purple"}
-    confusion_colors = {"red"}
+    teleport_colors = {"green", "yellow", "purple"}
 
     for color, cells in col.items():
-
         if color in teleport_colors and len(cells) >= 2:
             for i in range(0, len(cells) - 1, 2):
                 a, b = cells[i], cells[i + 1]
@@ -276,10 +273,6 @@ def assemble_map(hz, s, g):
                 ct[b] = TELEPORT
                 tele[a] = b
                 tele[b] = a
-
-        elif color in confusion_colors:
-            for c in cells:
-                ct[c] = CONFUSION
 
     ct[s] = START
     ct[g] = GOAL
@@ -369,8 +362,8 @@ class MazeEnvironment:
         return (tx, ty) if 0 <= tx < NUM_CELLS and 0 <= ty < NUM_CELLS else None
 
     def _deadly(self, xy, ai):
-      ct = self.cell_types.get(xy, EMPTY)
-      return ct == DEATH_PIT and xy not in self.fire_pivots
+        ct = self.cell_types.get(xy, EMPTY)
+        return ct == DEATH_PIT and xy not in self.fire_pivots
     
 
 
