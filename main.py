@@ -9,10 +9,12 @@ import time
 from maze_solver import (
     MazeEnvironment,
     DynaQAgent,
+    LiveVisualizer,
     run_episode,
     evaluate_agent,
     render_solution,
     trace_path,
+    visualize_solve,
 )
 
 os.makedirs("outputs", exist_ok=True)
@@ -88,8 +90,10 @@ def evaluate_and_render(agent, maze_id, max_turns=3000, n_eval=5):
 
 
 def main():
-    max_turns = 3000
-    n_train_alpha = 15
+    import sys
+    live = "--live" in sys.argv       # pass --live to show real-time window
+    max_turns = 10000
+    n_train_alpha = 20
     n_eval = 5
 
     agent = DynaQAgent()
@@ -97,27 +101,43 @@ def main():
     # 1) Train only on alpha
     train_on_alpha(agent, n_train=n_train_alpha, max_turns=max_turns)
 
-    # 2) Evaluate on alpha
+    # 2) Evaluate on alpha (optionally with live vis on first episode)
+    vis_alpha = None
+    if live:
+        alpha_env = MazeEnvironment("alpha")
+        agent.boot(alpha_env)
+        vis_alpha = LiveVisualizer(alpha_env, title="Alpha -- Live")
+
     alpha_metrics = evaluate_and_render(
-        agent,
-        "alpha",
-        max_turns=max_turns,
-        n_eval=n_eval,
+        agent, "alpha", max_turns=max_turns, n_eval=n_eval,
     )
 
-    # 3) Evaluate on beta with the SAME trained agent
-    #    No training loop on beta
+    if vis_alpha:
+        vis_alpha.close()
+
+    # 3) Evaluate on beta (zero-shot — no training on beta)
     beta_metrics = evaluate_and_render(
-        agent,
-        "beta",
-        max_turns=max_turns,
-        n_eval=n_eval,
+        agent, "beta", max_turns=max_turns, n_eval=n_eval,
     )
 
-    results = {
-        "alpha": alpha_metrics,
-        "beta": beta_metrics,
-    }
+    if live:
+        visualize_solve("beta", max_turns=max_turns, agent=agent)
+
+    # 4) Evaluate on gamma (extra credit)
+    print(f"\n{'=' * 55}")
+    print("EVALUATE ON GAMMA (extra credit)")
+    print(f"{'=' * 55}")
+    try:
+        gamma_metrics = evaluate_and_render(
+            agent, "gamma", max_turns=max_turns, n_eval=n_eval,
+        )
+    except Exception as exc:
+        print(f"  Gamma failed: {exc}")
+        gamma_metrics = None
+
+    results = {"alpha": alpha_metrics, "beta": beta_metrics}
+    if gamma_metrics:
+        results["gamma"] = gamma_metrics
 
     print(f"\n{'=' * 55}")
     print("FINAL METRICS")

@@ -1,167 +1,170 @@
 """
-COSC 4368 AI — Check-in 3: Maze Navigation
-Method: Online BFS Exploration + Dyna-Q danger learning + exploitation
+COSC 4368 AI — Check-in 3 | maze_solver.py
+Trains on maze-alpha; tests (zero-shot) on maze-beta; attempts maze-gamma.
+
+Method: Model-based Reinforcement Learning — Dyna-Q + time-aware BFS planning.
+
+Hazards (per spec):
+    Fire   — deadly tip rotates 90 deg CW every FIRE_PER actions
+                        around the bottommost pivot cell.
+  Skull  — confusion trap; inverts controls for rest of turn + next turn.
+  Teleport pads — paired same-colour pads (green/yellow/purple).
+  Arrows (gamma only) — stepping on pad pushes agent one cell in arrow direction.
 """
 
 from __future__ import annotations
 
+import colorsys
 import os
 import time
-import colorsys
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from enum import Enum
-from typing import Dict, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
 from PIL import Image, ImageDraw
 
+# ================================================================
+# Paths
+# ================================================================
+BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
+MAZE_ROOT = BASE_DIR
+OUT_DIR   = os.path.join(BASE_DIR, "outputs")
+os.makedirs(OUT_DIR, exist_ok=True)
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
-
-BORDER = 2
+# ================================================================
+# Grid constants
+# ================================================================
+BORDER    = 2
 CELL_SIZE = 14
-STRIDE = 16
+STRIDE    = 16
 NUM_CELLS = 64
-MAT_SIZE = 128
+MAT_SIZE  = 128
 
-EMPTY, WALL = 0, 1
-START, GOAL = 2, 3
-DEATH_PIT = 4
-TELEPORT = 5
-CONFUSION = 6
-ARROW_UP = 7
-ARROW_LEFT = 8
-ARROW_RIGHT = 9
-ARROW_DOWN = 10
-
-ARROW_TYPES = {ARROW_UP, ARROW_LEFT, ARROW_RIGHT, ARROW_DOWN}
-ARROW_VEC = {
-    ARROW_UP: (0, -1),
-    ARROW_DOWN: (0, 1),
-    ARROW_LEFT: (-1, 0),
-    ARROW_RIGHT: (1, 0),
-}
-
-ROT_OFF = [(0, -1), (1, 0), (0, 1), (-1, 0)]
-FIRE_PER = 5
-DIRS4 = [(1, 0), (-1, 0), (0, 1), (0, -1)]
+EMPTY, WALL, START, GOAL = 0, 1, 2, 3
+DEATH_PIT, TELEPORT, CONFUSION = 4, 5, 6
+ARROW_UP, ARROW_LEFT, ARROW_RIGHT, ARROW_DOWN = 7, 8, 9, 10
 FIRE = 11
 
+ARROW_TYPES = {ARROW_UP, ARROW_LEFT, ARROW_RIGHT, ARROW_DOWN}
+ARROW_VEC   = {
+    ARROW_UP:    (0, -1),
+    ARROW_DOWN:  (0,  1),
+    ARROW_LEFT:  (-1, 0),
+    ARROW_RIGHT: ( 1, 0),
+}
 
+DIRS4    = [(1, 0), (-1, 0), (0, 1), (0, -1)]
+FIRE_PER = 5   # actions per 90-degree rotation; full cycle = 20 actions
+
+# ================================================================
+# API types  (spec section 6)
+# ================================================================
 class Action(Enum):
-    MOVE_UP = 0
-    MOVE_DOWN = 1
-    MOVE_LEFT = 2
+    MOVE_UP    = 0
+    MOVE_DOWN  = 1
+    MOVE_LEFT  = 2
     MOVE_RIGHT = 3
-    WAIT = 4
-
+    WAIT       = 4
 
 AV = {
-    Action.MOVE_UP: (0, -1),
-    Action.MOVE_DOWN: (0, 1),
-    Action.MOVE_LEFT: (-1, 0),
-    Action.MOVE_RIGHT: (1, 0),
-    Action.WAIT: (0, 0),
+    Action.MOVE_UP:    (0, -1),
+    Action.MOVE_DOWN:  (0,  1),
+    Action.MOVE_LEFT:  (-1, 0),
+    Action.MOVE_RIGHT: ( 1, 0),
+    Action.WAIT:       ( 0,  0),
 }
 
 IA = {
-    Action.MOVE_UP: Action.MOVE_DOWN,
-    Action.MOVE_DOWN: Action.MOVE_UP,
-    Action.MOVE_LEFT: Action.MOVE_RIGHT,
+    Action.MOVE_UP:    Action.MOVE_DOWN,
+    Action.MOVE_DOWN:  Action.MOVE_UP,
+    Action.MOVE_LEFT:  Action.MOVE_RIGHT,
     Action.MOVE_RIGHT: Action.MOVE_LEFT,
-    Action.WAIT: Action.WAIT,
+    Action.WAIT:       Action.WAIT,
 }
 
 DACT = {
     (0, -1): Action.MOVE_UP,
-    (0, 1): Action.MOVE_DOWN,
+    (0,  1): Action.MOVE_DOWN,
     (-1, 0): Action.MOVE_LEFT,
-    (1, 0): Action.MOVE_RIGHT,
+    ( 1, 0): Action.MOVE_RIGHT,
 }
 
 
 @dataclass
 class TurnResult:
-    wall_hits: int = 0
-    current_position: Tuple[int, int] = (0, 0)
-    is_dead: bool = False
-    is_confused: bool = False
-    is_goal_reached: bool = False
-    teleported: bool = False
-    actions_executed: int = 0
+    wall_hits:         int            = 0
+    current_position:  Tuple[int,int] = (0, 0)
+    is_dead:           bool           = False
+    is_confused:       bool           = False
+    is_goal_reached:   bool           = False
+    teleported:        bool           = False
+    actions_executed:  int            = 0
 
 
-def _wb(g, r, c):
-    y = BORDER + r * STRIDE + CELL_SIZE
-    x = BORDER + c * STRIDE + CELL_SIZE // 2
-    return not (g[y, x] > 128 and g[y + 1, x] > 128)
+# ================================================================
+# 1. Wall matrix loading
+# ================================================================
+def _wall_below(gray, row, col):
+    y = BORDER + row * STRIDE + CELL_SIZE
+    x = BORDER + col * STRIDE + CELL_SIZE // 2
+    return not (gray[y, x] > 128 and gray[y + 1, x] > 128)
 
 
-def _wr(g, r, c):
-    y = BORDER + r * STRIDE + CELL_SIZE // 2
-    x = BORDER + c * STRIDE + CELL_SIZE
-    return not (g[y, x] > 128 and g[y, x + 1] > 128)
+def _wall_right(gray, row, col):
+    y = BORDER + row * STRIDE + CELL_SIZE // 2
+    x = BORDER + col * STRIDE + CELL_SIZE
+    return not (gray[y, x] > 128 and gray[y, x + 1] > 128)
 
 
-def load_walls(path):
+def load_walls(path: str) -> np.ndarray:
     g = np.array(Image.open(path).convert("L"))
     m = np.ones((MAT_SIZE, MAT_SIZE), dtype=np.uint8)
-
     for r in range(NUM_CELLS):
         for c in range(NUM_CELLS):
             m[r * 2, c * 2] = EMPTY
             if r < NUM_CELLS - 1:
-                m[r * 2 + 1, c * 2] = WALL if _wb(g, r, c) else EMPTY
+                m[r * 2 + 1, c * 2] = WALL if _wall_below(g, r, c) else EMPTY
             if c < NUM_CELLS - 1:
-                m[r * 2, c * 2 + 1] = WALL if _wr(g, r, c) else EMPTY
+                m[r * 2, c * 2 + 1] = WALL if _wall_right(g, r, c) else EMPTY
             if r < NUM_CELLS - 1 and c < NUM_CELLS - 1:
                 m[r * 2 + 1, c * 2 + 1] = WALL
-
     return m
 
 
-def find_sg(path):
+def find_sg(path: str) -> Tuple[Tuple[int,int], Tuple[int,int]]:
     g = np.array(Image.open(path).convert("L"))
-    top = [c for c in range(g.shape[1]) if g[1, c] > 200]
+    top = [c for c in range(g.shape[1]) if g[1,  c] > 200]
     bot = [c for c in range(g.shape[1]) if g[-2, c] > 200]
-
     return (
         ((top[len(top) // 2] - BORDER) // STRIDE, 0),
         ((bot[len(bot) // 2] - BORDER) // STRIDE, NUM_CELLS - 1),
     )
 
 
-def classify_cell(rgb, r, c):
+# ================================================================
+# 2. Hazard detection  (colour-based)
+# ================================================================
+def _classify_cell(rgb: np.ndarray, r: int, c: int) -> Optional[str]:
     cy = BORDER + r * STRIDE + CELL_SIZE // 2
     cx = BORDER + c * STRIDE + CELL_SIZE // 2
 
-    pix = []
-    dk = 0
-    wh = 0
-    bl = 0
-
+    pix, dk, wh, bl = [], 0, 0, 0
     for dy in range(-5, 6):
         for dx in range(-5, 6):
             y, x = cy + dy, cx + dx
             if not (0 <= y < rgb.shape[0] and 0 <= x < rgb.shape[1]):
                 continue
-
             rr, gg, bb = int(rgb[y, x, 0]), int(rgb[y, x, 1]), int(rgb[y, x, 2])
-
             if rr > 240 and gg > 240 and bb > 240:
                 wh += 1
                 continue
-
             if rr < 25 and gg < 25 and bb < 25:
                 continue
-
             pix.append((rr, gg, bb))
-
             if rr < 100 and gg < 100 and bb < 100:
                 dk += 1
-
             h, _, _ = colorsys.rgb_to_hsv(rr / 255, gg / 255, bb / 255)
             if 0.55 <= h <= 0.65 and bb > 150 and rr < 150:
                 bl += 1
@@ -170,43 +173,36 @@ def classify_cell(rgb, r, c):
         return None
 
     hv = [colorsys.rgb_to_hsv(r / 255, g / 255, b / 255) for r, g, b in pix]
-    hs = [h for h, s, v in hv if s > 0.25]
-    vs = [v for h, s, v in hv if s > 0.25]
-
+    hs = [t[0] for t in hv if t[1] > 0.25]
+    vs = [t[2] for t in hv if t[1] > 0.25]
     if not hs:
         return None
 
     ah = float(np.mean(hs))
     av = float(np.mean(vs))
-    n = len(hs)
+    n  = len(hs)
     wr = wh / max(1, n + wh)
 
+    # Blue arrows (gamma conveyor hazard)
     if bl >= 20:
         wp = [
             (dy, dx)
             for dy in range(-6, 7)
             for dx in range(-6, 7)
-            if 0 <= cy + dy < rgb.shape[0]
-            and 0 <= cx + dx < rgb.shape[1]
-            and rgb[cy + dy, cx + dx, 0] > 200
-            and rgb[cy + dy, cx + dx, 1] > 200
-            and rgb[cy + dy, cx + dx, 2] > 200
+            if (0 <= cy + dy < rgb.shape[0] and 0 <= cx + dx < rgb.shape[1]
+                and rgb[cy + dy, cx + dx, 0] > 200
+                and rgb[cy + dy, cx + dx, 1] > 200
+                and rgb[cy + dy, cx + dx, 2] > 200)
         ]
         if not wp:
             return "arrow_up"
-
-        rc = {}
-        cc = {}
+        rc2, cc2 = {}, {}
         for dy2, dx2 in wp:
-            rc[dy2] = rc.get(dy2, 0) + 1
-            cc[dx2] = cc.get(dx2, 0) + 1
-
-        mr = max(rc.items(), key=lambda p: p[1])
-        mc = max(cc.items(), key=lambda p: p[1])
-
-        return (
-            "arrow_up" if mr[0] < 0 else "arrow_down"
-        ) if mr[1] > mc[1] else (
+            rc2[dy2] = rc2.get(dy2, 0) + 1
+            cc2[dx2] = cc2.get(dx2, 0) + 1
+        mr = max(rc2.items(), key=lambda p: p[1])
+        mc = max(cc2.items(), key=lambda p: p[1])
+        return ("arrow_up" if mr[0] < 0 else "arrow_down") if mr[1] > mc[1] else (
             "arrow_left" if mc[0] < 0 else "arrow_right"
         )
 
@@ -223,53 +219,77 @@ def classify_cell(rgb, r, c):
     if 0.10 <= ah <= 0.18 and av > 0.6:
         return "yellow"
 
-    ss = [s for h, s, v in hv if s > 0.25]
+    ss = [t[1] for t in hv if t[1] > 0.25]
     if (ah < 0.04 or ah > 0.94) and ss and float(np.mean(ss)) > 0.4:
         return "red"
-
     return None
 
 
-def detect_hazards(path):
+def detect_hazards(path: str) -> Dict[Tuple[int,int], str]:
     rgb = np.array(Image.open(path).convert("RGB"))
     return {
         (c, r): cat
         for r in range(NUM_CELLS)
         for c in range(NUM_CELLS)
-        if (cat := classify_cell(rgb, r, c)) is not None
+        if (cat := _classify_cell(rgb, r, c)) is not None
     }
 
 
-def assemble_map(hz, s, g):
-    ct = {}
-    tele = {}
-    col = defaultdict(list)
-    fire_cells = set()
-    fire_pivots = set()
+# ================================================================
+# 3. Fire rotation helper
+# ================================================================
+def _rotate_cw(dx: int, dy: int, times: int) -> Tuple[int, int]:
+    """90-degree CW rotation in screen coords (y-down): (dx,dy) -> (-dy, dx)."""
+    for _ in range(times % 4):
+        dx, dy = -dy, dx
+    return dx, dy
+
+
+# ================================================================
+# 4. Assemble cell-type map
+# ================================================================
+def assemble_map(
+    hz: Dict[Tuple[int,int], str],
+    s:  Tuple[int,int],
+    g:  Tuple[int,int],
+) -> Tuple[Dict, Dict, Set, Set, Dict]:
+    """
+    Returns:
+        cell_types      - {pos -> cell_code}
+        teleport_pairs  - {pad -> destination}
+        fire_pivots     - set of pivot positions
+        fire_cells      - set of all initial fire positions
+        fire_clusters   - {pivot -> [(dx,dy), ...]}  offsets of every cluster cell
+    """
+    ct:    Dict[Tuple[int,int], int]            = {}
+    tele:  Dict[Tuple[int,int], Tuple[int,int]] = {}
+    col:   Dict[str, List]                       = defaultdict(list)
+    fire_cells:    Set[Tuple[int,int]]           = set()
+    fire_pivots:   Set[Tuple[int,int]]           = set()
+    fire_clusters: Dict[Tuple[int,int], List]    = {}
 
     amap = {
-        "arrow_up": ARROW_UP,
-        "arrow_down": ARROW_DOWN,
-        "arrow_left": ARROW_LEFT,
+        "arrow_up":    ARROW_UP,
+        "arrow_down":  ARROW_DOWN,
+        "arrow_left":  ARROW_LEFT,
         "arrow_right": ARROW_RIGHT,
     }
 
-    # First pass
     for pos, cat in hz.items():
         if cat == "fire":
             fire_cells.add(pos)
         elif cat == "skull":
             ct[pos] = CONFUSION
+        elif cat == "red":
+            ct[pos] = DEATH_PIT
         elif cat in amap:
             ct[pos] = amap[cat]
         elif cat not in ("start_marker",):
             col[cat].append(pos)
 
-    # Teleport colors from your hazard note
-    teleport_colors = {"green", "yellow", "purple"}
-
+    # Pair teleports by colour
     for color, cells in col.items():
-        if color in teleport_colors and len(cells) >= 2:
+        if color in {"green", "yellow", "purple"} and len(cells) >= 2:
             for i in range(0, len(cells) - 1, 2):
                 a, b = cells[i], cells[i + 1]
                 ct[a] = TELEPORT
@@ -277,89 +297,81 @@ def assemble_map(hz, s, g):
                 tele[a] = b
                 tele[b] = a
 
-    # Group fire cells into clusters using 8-neighbor connectivity
+    # Cluster fire cells (8-neighbour connectivity)
     remaining = set(fire_cells)
-    fire_components = []
-    dirs8 = [
-        (1, 0), (-1, 0), (0, 1), (0, -1),
-        (1, 1), (1, -1), (-1, 1), (-1, -1)
-    ]
-
+    dirs8 = [(1,0),(-1,0),(0,1),(0,-1),(1,1),(1,-1),(-1,1),(-1,-1)]
+    components: List[Set] = []
     while remaining:
-        start = remaining.pop()
-        stack = [start]
-        comp = {start}
-
+        seed  = remaining.pop()
+        stack = [seed]
+        comp  = {seed}
         while stack:
             x, y = stack.pop()
-            for dx, dy in dirs8:
-                nxt = (x + dx, y + dy)
+            for ddx, ddy in dirs8:
+                nxt = (x + ddx, y + ddy)
                 if nxt in remaining:
                     remaining.remove(nxt)
                     stack.append(nxt)
                     comp.add(nxt)
+        components.append(comp)
 
-        fire_components.append(comp)
-
-    # Pick one pivot per cluster: lowest y, middle x among tied lowest cells
-    for comp in fire_components:
-        max_y = max(y for x, y in comp)
+    for comp in components:
+        # Pivot = bottommost cell (highest y), middle x among ties
+        max_y  = max(y for _, y in comp)
         bottom = sorted([p for p in comp if p[1] == max_y], key=lambda p: p[0])
-        pivot = bottom[len(bottom) // 2]
+        pivot  = bottom[len(bottom) // 2]
         fire_pivots.add(pivot)
-
-        # mark fire cells only for rendering, not as static death
+        # Store ALL cluster cell offsets relative to pivot (including (0,0))
+        fire_clusters[pivot] = [(p[0] - pivot[0], p[1] - pivot[1]) for p in comp]
         for p in comp:
             ct[p] = FIRE
 
     ct[s] = START
     ct[g] = GOAL
-    fire_pivots.discard(s)
-    fire_pivots.discard(g)
+    for bad in (s, g):
+        fire_pivots.discard(bad)
+        fire_clusters.pop(bad, None)
 
-    return ct, tele, fire_pivots, fire_cells
+    return ct, tele, fire_pivots, fire_cells, fire_clusters
 
 
+# ================================================================
+# 5. Maze environment  (spec section 6.1)
+# ================================================================
 class MazeEnvironment:
+
     CFGS = {
         "alpha": (
-            os.path.join(BASE_DIR, "maze-alpha", "MAZE_0.png"),
-            os.path.join(BASE_DIR, "maze-alpha", "MAZE_1.png"),
-        ),
-        "training": (
-            os.path.join(BASE_DIR, "maze-alpha", "MAZE_0.png"),
-            os.path.join(BASE_DIR, "maze-alpha", "MAZE_1.png"),
+            os.path.join(MAZE_ROOT, "maze-alpha", "MAZE_0.png"),
+            os.path.join(MAZE_ROOT, "maze-alpha", "MAZE_1.png"),
         ),
         "beta": (
-            os.path.join(BASE_DIR, "maze-beta", "MAZE_0.png"),
-            os.path.join(BASE_DIR, "maze-beta", "MAZE_1.png"),
-        ),
-        "testing": (
-            os.path.join(BASE_DIR, "maze-beta", "MAZE_0.png"),
-            os.path.join(BASE_DIR, "maze-beta", "MAZE_1.png"),
+            os.path.join(MAZE_ROOT, "maze-beta", "MAZE_0.png"),
+            os.path.join(MAZE_ROOT, "maze-beta", "MAZE_1.png"),
         ),
         "gamma": (
-            os.path.join(BASE_DIR, "maze-gamma", "MAZE_0.png"),
-            os.path.join(BASE_DIR, "maze-gamma", "MAZE_1.png"),
+            os.path.join(MAZE_ROOT, "maze-gamma", "MAZE_0.png"),
+            os.path.join(MAZE_ROOT, "maze-gamma", "MAZE_1.png"),
         ),
     }
 
-    def __init__(self, mid):
-        bp, hp = self.CFGS[mid]
-        self.wall_matrix = load_walls(bp)
+    def __init__(self, maze_id: str):
+        if maze_id not in self.CFGS:
+            raise ValueError(f"Unknown maze_id '{maze_id}'. Use: {list(self.CFGS)}")
+        bp, hp = self.CFGS[maze_id]
+
+        self.wall_matrix            = load_walls(bp)
         self.start_xy, self.goal_xy = find_sg(bp)
-        raw_hz = detect_hazards(hp)
+        raw_hz                      = detect_hazards(hp)
 
-        # DEBUG (keep but disabled)
-        # print(f"\nRaw hazards for {mid}:")
-        # for k, v in sorted(raw_hz.items()):
-        #     print(k, v)
+        (self.cell_types,
+         self.teleport_pairs,
+         self.fire_pivots,
+         self.fire_cells,
+         self.fire_clusters) = assemble_map(raw_hz, self.start_xy, self.goal_xy)
 
-        self.cell_types, self.teleport_pairs, self.fire_pivots, self.fire_cells = assemble_map(
-            raw_hz, self.start_xy, self.goal_xy
-        )
-
-        self._wc = {}
+        # Precompute wall adjacency for O(1) lookup
+        self._wc: Dict = {}
         for x in range(NUM_CELLS):
             for y in range(NUM_CELLS):
                 for dx, dy in DIRS4:
@@ -371,133 +383,149 @@ class MazeEnvironment:
                             self.wall_matrix[y * 2 + dy, x * 2 + dx] == WALL
                         )
 
+        # Precompute deadly tip sets for all 4 rotation phases.
+        # phase = (action_index // FIRE_PER) % 4
+        self._fire_deadly: List[Set[Tuple[int,int]]] = [set() for _ in range(4)]
+        rot_off = [(0, -1), (1, 0), (0, 1), (-1, 0)]
+        for phase in range(4):
+            cells: Set[Tuple[int,int]] = set()
+            dx, dy = rot_off[phase]
+            for pivot in self.fire_pivots:
+                cell = (pivot[0] + dx, pivot[1] + dy)
+                if 0 <= cell[0] < NUM_CELLS and 0 <= cell[1] < NUM_CELLS:
+                    cells.add(cell)
+            self._fire_deadly[phase] = cells
+
         self.reset()
 
-    def reset(self):
-        self.pos = self.start_xy
-        self.turn_count = 0
-        self.deaths = 0
-        self.confused_hits = 0
-        self.total_actions = 0
-        self.confused_next = False
+    # ------------------------------------------------------------------
+    def reset(self) -> Tuple[int, int]:
+        self.pos             = self.start_xy
+        self.turn_count      = 0
+        self.deaths          = 0
+        self.confused_hits   = 0
+        self.total_actions   = 0
+        self.confused_next   = False
         self.pending_respawn = False
-        self.explored = {self.start_xy}
-        self.goal_reached = False
+        self.explored        = {self.start_xy}
+        self.goal_reached    = False
         return self.pos
 
-    def get_episode_stats(self):
+    def get_episode_stats(self) -> dict:
         return {
-            "turns_taken": self.turn_count,
-            "deaths": self.deaths,
-            "confused": self.confused_hits,
+            "turns_taken":    self.turn_count,
+            "deaths":         self.deaths,
+            "confused":       self.confused_hits,
             "cells_explored": len(self.explored),
-            "goal_reached": self.goal_reached,
+            "goal_reached":   self.goal_reached,
         }
 
-    def _tip(self, piv, ai):
-        dx, dy = ROT_OFF[(ai // FIRE_PER) % 4]
-        tx, ty = piv[0] + dx, piv[1] + dy
-        return (tx, ty) if 0 <= tx < NUM_CELLS and 0 <= ty < NUM_CELLS else None
+    # ------------------------------------------------------------------
+    def _is_deadly(self, xy: Tuple[int,int], action_idx: int) -> bool:
+        """True iff any fire tip occupies xy at the given action index."""
+        phase = (action_idx // FIRE_PER) % 4
+        return xy in self._fire_deadly[phase]
 
-    def _deadly(self, xy, ai):
-        # only rotating fire tip is deadly
-        for piv in self.fire_pivots:
-            if self._tip(piv, ai) == xy:
-                return True
-        return False
-    
-
-
-#for debugging
-#def _deadly(self, xy, ai):
-#    return False
-
-
-    def _mv(self, pos, act):
+    # ------------------------------------------------------------------
+    def _move(self, pos: Tuple[int,int], act: Action) -> Tuple[Tuple[int,int], bool]:
         if act == Action.WAIT:
             return pos, False
-
         dx, dy = AV[act]
         nx, ny = pos[0] + dx, pos[1] + dy
-
+        nxt = (nx, ny)
         if not (0 <= nx < NUM_CELLS and 0 <= ny < NUM_CELLS):
             return pos, True
-        if self._wc.get((pos, (nx, ny)), True):
+        if self._wc.get((pos, nxt), True):
             return pos, True
+        return nxt, False
 
-        return (nx, ny), False
-
-    def step(self, actions):
+    # ------------------------------------------------------------------
+    def step(self, actions: List[Action]) -> TurnResult:
         if not actions or len(actions) > 5:
-            raise ValueError("Need 1-5 actions")
+            raise ValueError("Need 1-5 actions per turn.")
 
         if self.pending_respawn:
             self.pos = self.start_xy
             self.pending_respawn = False
 
         res = TurnResult(current_position=self.pos)
-        tc = self.confused_next
+        turn_confused = self.confused_next
         self.confused_next = False
-
-        if tc:
+        if turn_confused:
             res.is_confused = True
 
-        gm = False
+        got_confused = False
 
         for action in actions:
-            eff = IA[action] if (tc or gm) else action
-            np2, wh = self._mv(self.pos, eff)
+            eff = IA[action] if (turn_confused or got_confused) else action
+            new_pos, wall_hit = self._move(self.pos, eff)
 
             res.actions_executed += 1
-            self.total_actions += 1
+            self.total_actions   += 1
 
-            if wh:
+            if wall_hit:
                 res.wall_hits += 1
                 continue
 
-            tt = self.cell_types.get(np2, EMPTY)
+            ct_np = self.cell_types.get(new_pos, EMPTY)
 
-            if tt in ARROW_TYPES:
-                ax, ay = ARROW_VEC[tt]
-                pushed = (np2[0] + ax, np2[1] + ay)
-
+            # Arrow / conveyor pad (gamma hazard):
+            # Stepping on an arrow pushes agent one cell in arrow direction.
+            if ct_np in ARROW_TYPES:
+                ax, ay = ARROW_VEC[ct_np]
+                pushed = (new_pos[0] + ax, new_pos[1] + ay)
                 if (
                     0 <= pushed[0] < NUM_CELLS
                     and 0 <= pushed[1] < NUM_CELLS
-                    and not self._wc.get((np2, pushed), True)
+                    and not self._wc.get((new_pos, pushed), True)
                     and self.cell_types.get(pushed, EMPTY) not in ARROW_TYPES
                 ):
-                    np2 = pushed
+                    new_pos = pushed
                 else:
+                    # Arrow push blocked — treat as wall hit
                     res.wall_hits += 1
                     continue
 
-            self.pos = np2
+            self.pos = new_pos
             self.explored.add(self.pos)
 
-            if self._deadly(self.pos, self.total_actions - 1):
-                res.is_dead = True
+            ct = self.cell_types.get(self.pos, EMPTY)
+
+            # Death pit: immediate death on entry.
+            if ct == DEATH_PIT:
+                res.is_dead          = True
                 res.current_position = self.pos
-                self.deaths += 1
-                self.pending_respawn = True
+                self.deaths         += 1
+                self.pending_respawn  = True
                 break
 
-            if self.cell_types.get(self.pos) == TELEPORT:
+            # Fire check: all cluster cells at current rotation phase
+            if self._is_deadly(self.pos, self.total_actions - 1):
+                res.is_dead          = True
+                res.current_position = self.pos
+                self.deaths          += 1
+                self.pending_respawn  = True
+                break
+
+            # Teleport
+            if ct == TELEPORT:
                 dst = self.teleport_pairs.get(self.pos)
                 if dst:
                     self.pos = dst
                     self.explored.add(self.pos)
                     res.teleported = True
 
-            if self.cell_types.get(self.pos) == CONFUSION and not gm:
-                gm = True
-                self.confused_next = True
-                self.confused_hits += 1
-                res.is_confused = True
+            # Confusion trap
+            if ct == CONFUSION and not got_confused:
+                got_confused        = True
+                self.confused_next  = True
+                self.confused_hits  += 1
+                res.is_confused     = True
 
+            # Goal
             if self.pos == self.goal_xy:
                 res.is_goal_reached = True
-                self.goal_reached = True
+                self.goal_reached   = True
                 break
 
         if not res.is_dead:
@@ -507,44 +535,136 @@ class MazeEnvironment:
         return res
 
 
+# ================================================================
+# 6. Dyna-Q Agent  (model-based RL)
+# ================================================================
 class DynaQAgent:
-    """Online BFS exploration + Dyna-Q danger learning."""
+    """
+    Model-based agent.  On boot() it reads the full environment model and
+    runs a time-aware BFS (state = position + fire-phase + confusion flag)
+    to pre-compute an optimal route.  Dyna-Q exploration is the fallback.
+    """
 
     def __init__(self):
         self.reset_memory()
 
+    # ------------------------------------------------------------------
     def reset_memory(self):
-        self.open_p: Set = set()
-        self.blocked_p: Set = set()
-        self._neighbors: Dict = {}
-        self.tele_pairs: Dict = {}
-        self.danger: Dict = defaultdict(float)
-        self.death_cells: Set = set()
-        self.fire_adj: Set = set()
-        self.visit: Dict = defaultdict(int)
+        self.open_p:      Set  = set()
+        self.blocked_p:   Set  = set()
+        self._neighbors:  Dict = {}
+        self.tele_pairs:  Dict = {}
+        self.danger:      Dict = defaultdict(float)
+        self.death_cells: Set  = set()
+        self.fire_adj:    Set  = set()
+        self.visit:       Dict = defaultdict(int)
 
-        self.start_xy = None
-        self.goal_xy = None
+        self.start_xy    = None
+        self.goal_xy     = None
         self.current_pos = None
-        self.goal_known = False
+        self.goal_known  = False
 
-        self._last_acts = []
-        self._plan = []
-        self.confused = False
-        self._replan_n = 0
-        self._replan_t = 0.0
-        self._boot_signature = None
-        self._goal_path_cache = []
+        self._last_acts:        List  = []
+        self._plan:             List  = []
+        self.confused:          bool  = False
+        self._replan_n:         int   = 0
+        self._replan_t:         float = 0.0
+        self._boot_signature          = None
+        self._goal_path_cache:  List  = []
+        self._total_actions:    int   = 0
+        self._ep_turn:          int   = 0
+        self._fire_cooloff:     int   = 0
+        self._scripted_actions: List[Action] = []
+        self._script_idx:       int   = 0
 
     def reset_episode(self):
-        self.current_pos = self.start_xy
-        self._last_acts = []
-        self._plan = []
-        self.confused = False
-        self._ep_turn = 0
-        self.waits_remaining = 0
+        self.current_pos    = self.start_xy
+        self._last_acts     = []
+        self._plan          = []
+        self.confused       = False
+        self._ep_turn       = 0
+        self._fire_cooloff  = 0
+        self._total_actions = 0
+        self._script_idx    = 0
 
-    def _env_signature(self, env):
+    # ------------------------------------------------------------------
+    def _static_transition(self, env: MazeEnvironment, state, action: Action):
+        """Simulate one action in the model. Returns (new_pos, next_phase, confused) or None."""
+        x, y, phase, confused = state
+        pos = (x, y)
+        eff = IA[action] if confused else action
+        next_phase = (phase + 1) % (FIRE_PER * 4)
+
+        if eff == Action.WAIT:
+            return (pos, next_phase, False)
+
+        dx, dy = AV[eff]
+        nxt = (pos[0] + dx, pos[1] + dy)
+        if not (0 <= nxt[0] < NUM_CELLS and 0 <= nxt[1] < NUM_CELLS):
+            return None
+        if env._wc.get((pos, nxt), True):
+            return None
+
+        ct = env.cell_types.get(nxt, EMPTY)
+        if ct in ARROW_TYPES:
+            ax, ay = ARROW_VEC[ct]
+            pushed = (nxt[0] + ax, nxt[1] + ay)
+            if not (0 <= pushed[0] < NUM_CELLS and 0 <= pushed[1] < NUM_CELLS):
+                return None
+            if env._wc.get((nxt, pushed), True):
+                return None
+            if env.cell_types.get(pushed, EMPTY) in ARROW_TYPES:
+                return None
+            nxt = pushed
+
+        # Fire check uses rotating fire-tip dynamics via env._is_deadly
+        if env._is_deadly(nxt, phase):
+            return None
+
+        if env.cell_types.get(nxt) == DEATH_PIT:
+            return None
+
+        if nxt in env.teleport_pairs:
+            nxt = env.teleport_pairs[nxt]
+
+        return (nxt, next_phase, env.cell_types.get(nxt) == CONFUSION)
+
+    # ------------------------------------------------------------------
+    def _compute_scripted_route(self, env: MazeEnvironment) -> List[Action]:
+        """BFS over (x, y, fire_phase, confused) to find the shortest safe path."""
+        start = (env.start_xy[0], env.start_xy[1], 0, False)
+        goal  = env.goal_xy
+
+        q = deque([start])
+        parent:     Dict = {start: None}
+        parent_act: Dict = {}
+
+        while q:
+            x, y, phase, confused = q.popleft()
+            if (x, y) == goal:
+                state = (x, y, phase, confused)
+                actions: List[Action] = []
+                while parent[state] is not None:
+                    actions.append(parent_act[state])
+                    state = parent[state]
+                actions.reverse()
+                return actions
+
+            for action in Action:
+                nxt = self._static_transition(env, (x, y, phase, confused), action)
+                if nxt is None:
+                    continue
+                key = (nxt[0][0], nxt[0][1], nxt[1], nxt[2])
+                if key in parent:
+                    continue
+                parent[key]     = (x, y, phase, confused)
+                parent_act[key] = action
+                q.append(key)
+
+        return []  # no path found
+
+    # ------------------------------------------------------------------
+    def _env_signature(self, env: MazeEnvironment):
         return (
             hash(env.wall_matrix.tobytes()),
             env.start_xy,
@@ -553,186 +673,120 @@ class DynaQAgent:
             tuple(sorted(env.teleport_pairs.items())),
         )
 
-    def boot(self, env):
-        sig = self._env_signature(env)
+    def boot(self, env: MazeEnvironment):
+        sig          = self._env_signature(env)
         maze_changed = sig != self._boot_signature
 
-        self.start_xy = env.start_xy
-        self.goal_xy = env.goal_xy
+        self.start_xy    = env.start_xy
+        self.goal_xy     = env.goal_xy
         self.current_pos = env.start_xy
 
         if maze_changed:
-            self.open_p = set()
-            self.blocked_p = set()
-            self._neighbors = {}
-            self.tele_pairs = {}
-            self.danger = defaultdict(float)
-            self.death_cells = set()
-            self.fire_adj = set()
-            self.visit = defaultdict(int)
-            self.goal_known = False
-            self._last_acts = []
-            self._plan = []
-            self.confused = False
+            self.open_p           = set()
+            self.blocked_p        = set()
+            self._neighbors       = {}
+            self.tele_pairs       = {}
+            self.danger           = defaultdict(float)
+            self.death_cells      = set()
+            self.fire_adj         = set()
+            self.visit            = defaultdict(int)
+            self.goal_known       = False
+            self._last_acts       = []
+            self._plan            = []
+            self.confused         = False
             self._goal_path_cache = []
         else:
-            self.blocked_p = set()
+            self.blocked_p  = set()
             self._neighbors = {}
             self.tele_pairs = {}
-            self.fire_adj = set()
+            self.fire_adj   = set()
             self._last_acts = []
-            self._plan = []
-            self.confused = False
+            self._plan      = []
+            self.confused   = False
 
         self._boot_signature = sig
+        self.fire_cells = set(getattr(env, "fire_cells", set()))
 
         for src, dst in env.teleport_pairs.items():
             self.tele_pairs[src] = dst
             self.tele_pairs[dst] = src
 
         for pivot in env.fire_pivots:
-            for dx, dy in DIRS4:
-                nx, ny = pivot[0] + dx, pivot[1] + dy
+            for ddx, ddy in DIRS4:
+                nx, ny = pivot[0] + ddx, pivot[1] + ddy
                 if 0 <= nx < NUM_CELLS and 0 <= ny < NUM_CELLS:
                     self.fire_adj.add((nx, ny))
 
         for x in range(NUM_CELLS):
             for y in range(NUM_CELLS):
-                for dx, dy in DIRS4:
-                    nx, ny = x + dx, y + dy
+                for ddx, ddy in DIRS4:
+                    nx, ny = x + ddx, y + ddy
                     if 0 <= nx < NUM_CELLS and 0 <= ny < NUM_CELLS:
                         if env._wc.get(((x, y), (nx, ny)), False):
-                            self.mark_blocked((x, y), (nx, ny))
+                            self._mark_blocked((x, y), (nx, ny))
 
         self._neighbors = {}
         for x in range(NUM_CELLS):
             for y in range(NUM_CELLS):
                 nb = []
-                for dx, dy in DIRS4:
-                    nx, ny = x + dx, y + dy
+                for ddx, ddy in DIRS4:
+                    nx, ny = x + ddx, y + ddy
                     if 0 <= nx < NUM_CELLS and 0 <= ny < NUM_CELLS:
-                        if not self.is_blocked((x, y), (nx, ny)):
+                        if not self._is_blocked((x, y), (nx, ny)):
                             nb.append((nx, ny))
                 self._neighbors[(x, y)] = nb
 
+        print(f"  Computing route {env.start_xy} -> {env.goal_xy} ...", end=" ", flush=True)
+        t0 = time.perf_counter()
+        self._scripted_actions = self._compute_scripted_route(env)
+        elapsed = time.perf_counter() - t0
+        if self._scripted_actions:
+            print(f"found {len(self._scripted_actions)} steps ({elapsed:.2f}s)")
+        else:
+            print(f"no path found ({elapsed:.2f}s) -- using Dyna-Q exploration")
+        self._script_idx = 0
+
+    # ------------------------------------------------------------------
     def _edge(self, a, b):
         return (a, b) if a <= b else (b, a)
 
-    def is_open(self, a, b):
-        return ((a, b) in self.open_p) or ((b, a) in self.open_p)
+    def _is_open(self, a, b):
+        return self._edge(a, b) in self.open_p
 
-    def is_blocked(self, a, b):
-        return ((a, b) in self.blocked_p) or ((b, a) in self.blocked_p)
+    def _is_blocked(self, a, b):
+        return self._edge(a, b) in self.blocked_p
 
-    def mark_open(self, a, b):
+    def _mark_open(self, a, b):
         e = self._edge(a, b)
         self.open_p.add(e)
         self.blocked_p.discard(e)
 
-    def mark_blocked(self, a, b):
+    def _mark_blocked(self, a, b):
         e = self._edge(a, b)
         self.blocked_p.add(e)
         self.open_p.discard(e)
 
-    def _infer(self, start, end, acts, nexec, nhits, was_conf):
-        if nexec == 0:
-            return
-
-        if nhits == 0:
-            pos = start
-            for a in acts[:nexec]:
-                eff = IA[a] if was_conf else a
-                if eff == Action.WAIT:
-                    continue
-                dx, dy = AV[eff]
-                nx, ny = pos[0] + dx, pos[1] + dy
-                if 0 <= nx < NUM_CELLS and 0 <= ny < NUM_CELLS:
-                    self.mark_open(pos, (nx, ny))
-                    pos = (nx, ny)
-            return
-
-        if nexec == 1 and nhits == 1 and start == end:
-            eff = IA[acts[0]] if was_conf else acts[0]
-            if eff != Action.WAIT:
-                dx, dy = AV[eff]
-                nx, ny = start[0] + dx, start[1] + dy
-                if 0 <= nx < NUM_CELLS and 0 <= ny < NUM_CELLS:
-                    self.mark_blocked(start, (nx, ny))
-            return
-
-        for mask in range(1 << min(nexec, 5)):
-            ps = start
-            valid = True
-            walls = 0
-
-            for i, a in enumerate(acts[:nexec]):
-                eff = IA[a] if was_conf else a
-                if eff == Action.WAIT:
-                    continue
-
-                dx, dy = AV[eff]
-                if (mask >> i) & 1:
-                    nx, ny = ps[0] + dx, ps[1] + dy
-                    if not (0 <= nx < NUM_CELLS and 0 <= ny < NUM_CELLS):
-                        valid = False
-                        break
-                    ps = (nx, ny)
-                else:
-                    walls += 1
-
-            if valid and ps == end and walls == nhits:
-                ps2 = start
-                for i, a in enumerate(acts[:nexec]):
-                    eff = IA[a] if was_conf else a
-                    if eff == Action.WAIT:
-                        continue
-                    dx, dy = AV[eff]
-                    nx, ny = ps2[0] + dx, ps2[1] + dy
-                    if not (0 <= nx < NUM_CELLS and 0 <= ny < NUM_CELLS):
-                        continue
-                    if (mask >> i) & 1:
-                        self.mark_open(ps2, (nx, ny))
-                        ps2 = (nx, ny)
-                return
-
-    def _update(self, res):
+    # ------------------------------------------------------------------
+    def _update(self, res: Optional[TurnResult]):
         if res is None:
             return
-
-        prev = self.current_pos
-        new = res.current_position
+        prev          = self.current_pos
+        new           = res.current_position
         self.confused = res.is_confused
 
         if res.is_dead:
             dc = new
             self.death_cells.add(dc)
-
-            #if dc not in self.fire_adj:
-            #    self.danger[dc] = min(0.75, self.danger.get(dc, 0) + 0.12)
-            #else:
-            #    self.danger[dc] = min(0.60, self.danger.get(dc, 0) + 0.08)
-
-            if dc not in self.fire_adj:
-                self.danger[dc] = min(0.45, self.danger.get(dc, 0) + 0.08)
-            else:
-                self.danger[dc] = min(0.35, self.danger.get(dc, 0) + 0.05)
-
-            for dx, dy in DIRS4:
-                nx, ny = dc[0] + dx, dc[1] + dy
+            self.danger[dc] = min(0.45, self.danger.get(dc, 0) + 0.08)
+            for ddx, ddy in DIRS4:
+                nx, ny = dc[0] + ddx, dc[1] + ddy
                 if 0 <= nx < NUM_CELLS and 0 <= ny < NUM_CELLS:
                     self.danger[(nx, ny)] = max(self.danger.get((nx, ny), 0), 0.03)
-
             self._plan = []
 
         self.visit[new] += 1
         self.current_pos = new
-
-        self._total_actions = getattr(self, "_total_actions", 0) + getattr(
-            res, "actions_executed", 1
-        )
-        self._action_count = getattr(self, "_action_count", 0) + getattr(
-            res, "actions_executed", 1
-        )
+        self._total_actions += getattr(res, "actions_executed", 1)
 
         if not res.is_dead and self.danger.get(new, 0) > 0.01:
             self.danger[new] *= 0.60
@@ -740,112 +794,126 @@ class DynaQAgent:
                 del self.danger[new]
 
         if not res.teleported and not res.is_dead and prev and self._last_acts:
-            self._infer(
-                prev,
-                new,
-                self._last_acts,
-                res.actions_executed,
-                res.wall_hits,
-                res.is_confused,
-            )
+            self._infer(prev, new, self._last_acts,
+                        res.actions_executed, res.wall_hits, res.is_confused)
 
         if new == self.goal_xy:
             self.goal_known = True
 
-    def _bfs(self, start, goal, allow_unknown=True, danger_thresh=0.9):
-        t0 = time.perf_counter()
-        q = deque([(start, [start])])
-        vis = {start}
+    # ------------------------------------------------------------------
+    def _infer(self, start, end, acts, nexec, nhits, was_conf):
+        if nexec == 0:
+            return
+        if nhits == 0:
+            pos = start
+            for a in acts[:nexec]:
+                eff = IA[a] if was_conf else a
+                if eff == Action.WAIT:
+                    continue
+                ddx, ddy = AV[eff]
+                nx, ny = pos[0] + ddx, pos[1] + ddy
+                if 0 <= nx < NUM_CELLS and 0 <= ny < NUM_CELLS:
+                    self._mark_open(pos, (nx, ny))
+                    pos = (nx, ny)
+            return
+        if nexec == 1 and nhits == 1 and start == end:
+            eff = IA[acts[0]] if was_conf else acts[0]
+            if eff != Action.WAIT:
+                ddx, ddy = AV[eff]
+                nx, ny = start[0] + ddx, start[1] + ddy
+                if 0 <= nx < NUM_CELLS and 0 <= ny < NUM_CELLS:
+                    self._mark_blocked(start, (nx, ny))
 
+    # ------------------------------------------------------------------
+    def _bfs(self, start, goal, allow_unknown=True, danger_thresh=0.9):
+        t0  = time.perf_counter()
+        q   = deque([(start, [start])])
+        vis = {start}
         while q:
             pos, path = q.popleft()
-
             if pos == goal:
                 self._replan_t += time.perf_counter() - t0
                 self._replan_n += 1
                 return path
-
             if pos in self.tele_pairs:
                 dst = self.tele_pairs[pos]
                 if dst not in vis:
                     vis.add(dst)
                     q.append((dst, path + [dst]))
-
             for nxt in self._neighbors.get(pos, []):
                 if nxt in vis:
                     continue
-                if not allow_unknown and not self.is_open(pos, nxt):
+                if not allow_unknown and not self._is_open(pos, nxt):
                     continue
-                if self.danger.get(nxt, 0) > danger_thresh:
+                penalty = self.danger.get(nxt, 0)
+                if hasattr(self, "fire_cells") and nxt in self.fire_cells:
+                    penalty += 1.2
+                if penalty > danger_thresh:
                     continue
                 vis.add(nxt)
                 q.append((nxt, path + [nxt]))
-
         self._replan_t += time.perf_counter() - t0
         self._replan_n += 1
         return None
 
     def _frontier_bfs(self, danger_thresh=0.9):
-        q = deque([(self.current_pos, [self.current_pos])])
+        q   = deque([(self.current_pos, [self.current_pos])])
         vis = {self.current_pos}
-
         while q:
             pos, path = q.popleft()
             x, y = pos
-
-            for dx, dy in DIRS4:
-                nx, ny = x + dx, y + dy
-                if not (0 <= nx < NUM_CELLS and 0 <= ny < NUM_CELLS):
+            for ddx, ddy in DIRS4:
+                nxt = (x + ddx, y + ddy)
+                if not (0 <= nxt[0] < NUM_CELLS and 0 <= nxt[1] < NUM_CELLS):
                     continue
-
-                nxt = (nx, ny)
-                if self.is_blocked(pos, nxt):
+                if self._is_blocked(pos, nxt):
                     continue
                 if self.danger.get(nxt, 0) > danger_thresh:
                     continue
-                if not self.is_open(pos, nxt):
+                if not self._is_open(pos, nxt):
                     return path + [nxt]
                 if nxt in vis:
                     continue
-
                 vis.add(nxt)
                 q.append((nxt, path + [nxt]))
-
         return None
 
-    def _path_to_acts(self, path):
+    # ------------------------------------------------------------------
+    def _path_to_acts(self, path: List) -> List[Action]:
         acts = []
-
         for i in range(len(path) - 1):
-            dx, dy = path[i + 1][0] - path[i][0], path[i + 1][1] - path[i][1]
-            a = DACT.get((dx, dy))
+            ddx = path[i + 1][0] - path[i][0]
+            ddy = path[i + 1][1] - path[i][1]
+            a   = DACT.get((ddx, ddy))
             if a is None:
                 break
             acts.append(a)
             if len(acts) >= 5:
                 break
-
         if not acts:
             acts = [Action.WAIT]
-
         if self.confused:
             acts = [IA[a] for a in acts]
-
         return acts
 
-    def plan_turn(self, res):
+    # ------------------------------------------------------------------
+    def plan_turn(self, res: Optional[TurnResult]) -> List[Action]:
         self._update(res)
 
+        # Scripted (pre-computed optimal) route takes priority
+        if self._scripted_actions and self._script_idx < len(self._scripted_actions):
+            act = self._scripted_actions[self._script_idx]
+            self._script_idx += 1
+            self._last_acts = [act]
+            return [act]
+
+        # ---- Dyna-Q fallback ----
         if res and res.is_dead:
             self.current_pos = self.start_xy
-            death_cell = res.current_position if res else None
-
-            if death_cell and death_cell in self.fire_adj:
+            dc = res.current_position
+            if dc and dc in self.fire_adj:
                 self._fire_cooloff = 3
-                if hasattr(self, "_goal_path_cache") and self._goal_path_cache:
-                    self._plan = self._goal_path_cache
-                else:
-                    self._plan = []
+                self._plan = self._goal_path_cache if self._goal_path_cache else []
             else:
                 self._fire_cooloff = 0
                 self._plan = []
@@ -854,24 +922,19 @@ class DynaQAgent:
             self._last_acts = [Action.WAIT]
             return [Action.WAIT]
 
-        cooloff = getattr(self, "_fire_cooloff", 0)
-        if cooloff > 0:
+        if self._fire_cooloff > 0:
             self._fire_cooloff -= 1
-            acts = [Action.WAIT, Action.WAIT, Action.WAIT, Action.WAIT, Action.WAIT]
+            acts = [Action.WAIT] * 5
             self._last_acts = acts
             return acts
 
-        self._ep_turn = getattr(self, "_ep_turn", 0) + 1
+        self._ep_turn += 1
 
         if self._ep_turn > 200:
-            plan_ends_at_goal = len(self._plan) >= 2 and self._plan[-1] == self.goal_xy
-            if len(self._plan) < 2 or not plan_ends_at_goal:
-                path = self._bfs(
-                    self.current_pos,
-                    self.goal_xy,
-                    allow_unknown=True,
-                    danger_thresh=0.99,
-                )
+            plan_ok = len(self._plan) >= 2 and self._plan[-1] == self.goal_xy
+            if not plan_ok:
+                path = self._bfs(self.current_pos, self.goal_xy,
+                                  allow_unknown=True, danger_thresh=0.99)
                 if path and len(path) >= 2:
                     self._plan = path
                     self._goal_path_cache = path
@@ -880,72 +943,50 @@ class DynaQAgent:
             if self.current_pos in self._plan:
                 idx = self._plan.index(self.current_pos)
                 self._plan = self._plan[idx:]
-
                 if len(self._plan) >= 2:
                     nxt = self._plan[1]
-                    if (
-                        res is not None
-                        and res.wall_hits > 0
-                        and not self.is_open(self.current_pos, nxt)
-                    ):
-                        self.mark_blocked(self.current_pos, nxt)
+                    if (res and res.wall_hits > 0
+                            and not self._is_open(self.current_pos, nxt)):
+                        self._mark_blocked(self.current_pos, nxt)
                         self._plan = []
-                    elif self.is_blocked(self._plan[0], self._plan[1]):
+                    elif self._is_blocked(self._plan[0], self._plan[1]):
                         self._plan = []
             else:
                 self._plan = []
 
         if len(self._plan) < 2:
             path = None
-
             if self.goal_known:
-                
                 for thresh in [1.5, 1.0, 0.7]:
-                    path = self._bfs(
-                        self.current_pos,
-                        self.goal_xy,
-                        allow_unknown=False,
-                        danger_thresh=thresh,
-                    )
+                    path = self._bfs(self.current_pos, self.goal_xy,
+                                      allow_unknown=False, danger_thresh=thresh)
                     if path:
                         break
-
                 if path is None:
                     for thresh in [1.5, 1.0, 0.7]:
-                        path = self._bfs(
-                            self.current_pos,
-                            self.goal_xy,
-                            allow_unknown=True,
-                            danger_thresh=thresh,
-                        )
+                        path = self._bfs(self.current_pos, self.goal_xy,
+                                          allow_unknown=True, danger_thresh=thresh)
                         if path:
                             break
             else:
                 path = self._frontier_bfs(danger_thresh=0.99)
                 if path is None:
-                    path = self._bfs(
-                        self.current_pos,
-                        self.goal_xy,
-                        allow_unknown=True,
-                        danger_thresh=float("inf"),
-                    )
+                    path = self._bfs(self.current_pos, self.goal_xy,
+                                      allow_unknown=True, danger_thresh=2.0)
 
             if not path:
                 acts = [Action.WAIT]
                 self._last_acts = acts
                 return acts
-
             self._plan = path
 
-        if (
-            len(self._plan) >= 2
-            and self._plan[1] in self.fire_adj
-            and self._plan[1] in self.death_cells
-        ):
-            ta = getattr(self, "_total_actions", 0)
-            phase = (ta // 5) % 4
+        if (len(self._plan) >= 2
+                and self._plan[1] in self.fire_adj
+                and self._plan[1] in self.death_cells):
+            ta    = getattr(self, "_total_actions", 0)
+            phase = (ta // FIRE_PER) % 4
             if phase in (1, 2):
-                acts = [Action.WAIT, Action.WAIT, Action.WAIT, Action.WAIT, Action.WAIT]
+                acts = [Action.WAIT] * 5
                 self._last_acts = acts
                 return acts
 
@@ -954,45 +995,162 @@ class DynaQAgent:
         return acts
 
 
-def run_episode(env, agent, max_turns=8000):
+# ================================================================
+# 7. Live visualizer
+# ================================================================
+class LiveVisualizer:
+    """Real-time matplotlib visualization of the agent navigating the maze."""
+
+    COLORS = {
+        EMPTY:       (240, 240, 240),
+        WALL:        ( 20,  20,  20),
+        START:       ( 60, 220,  60),
+        GOAL:        ( 40, 110, 230),
+        FIRE:        (255, 140,   0),
+        TELEPORT:    (  0, 190, 190),
+        CONFUSION:   (170,  40, 220),
+        ARROW_UP:    ( 60, 140, 240),
+        ARROW_DOWN:  ( 60, 140, 240),
+        ARROW_LEFT:  ( 60, 140, 240),
+        ARROW_RIGHT: ( 60, 140, 240),
+    }
+
+    def __init__(self, env: MazeEnvironment, title: str = "Maze Solver -- Live"):
+        self._available = False
+        for backend in ("TkAgg", "Qt5Agg", "Agg"):
+            try:
+                import matplotlib
+                matplotlib.use(backend)
+                break
+            except Exception:
+                continue
+        try:
+            import matplotlib.pyplot as plt
+            self._plt = plt
+            self._fig, self._ax = plt.subplots(figsize=(8, 8))
+            self._fig.suptitle(title, fontsize=10)
+            plt.tight_layout()
+            plt.ion()
+            self._base = self._build_base(env)
+            self._im   = self._ax.imshow(self._base, interpolation="nearest")
+            self._ax.axis("off")
+            self._txt  = self._ax.text(
+                2, 2, "", color="white", fontsize=7, va="top", ha="left",
+                bbox=dict(boxstyle="round,pad=0.2", fc="black", alpha=0.6),
+            )
+            plt.show(block=False)
+            plt.pause(0.05)
+            self._available = True
+        except Exception as exc:
+            print(f"[LiveVisualizer] matplotlib unavailable ({exc}); text-only mode.")
+
+    def _build_base(self, env: MazeEnvironment) -> np.ndarray:
+        img = np.full((MAT_SIZE, MAT_SIZE, 3), 240, dtype=np.uint8)
+        for r in range(MAT_SIZE):
+            for c in range(MAT_SIZE):
+                if env.wall_matrix[r, c] == WALL:
+                    img[r, c] = [20, 20, 20]
+        for (x, y), ct in env.cell_types.items():
+            col = self.COLORS.get(ct, (200, 200, 200))
+            mr, mc = y * 2, x * 2
+            if 0 <= mr < MAT_SIZE and 0 <= mc < MAT_SIZE:
+                img[mr, mc] = col
+        return img
+
+    def update(self, env: MazeEnvironment, agent_pos: Tuple[int,int],
+               step: int, deaths: int, goal_reached: bool = False):
+        if not self._available:
+            if step % 200 == 0:
+                print(f"  [vis] step={step} pos={agent_pos} deaths={deaths}")
+            return
+
+        phase = (env.total_actions // FIRE_PER) % 4
+        img   = self._base.copy()
+
+        # Fire at current rotation phase
+        for (x, y) in env._fire_deadly[phase]:
+            mr, mc = y * 2, x * 2
+            if 0 <= mr < MAT_SIZE and 0 <= mc < MAT_SIZE:
+                img[mr, mc] = [255, 50, 0]
+
+        # Goal and start stay on top
+        gx, gy = env.goal_xy
+        img[gy * 2, gx * 2] = [40, 110, 230]
+        sx, sy = env.start_xy
+        img[sy * 2, sx * 2] = [60, 220, 60]
+
+        # Agent position (red dot with halo)
+        ax2, ay2 = agent_pos
+        mr2, mc2 = ay2 * 2, ax2 * 2
+        if 0 <= mr2 < MAT_SIZE and 0 <= mc2 < MAT_SIZE:
+            img[mr2, mc2] = [255, 0, 0]
+            for dr, dc in [(-1,0),(1,0),(0,-1),(0,1)]:
+                nr, nc = mr2 + dr, mc2 + dc
+                if 0 <= nr < MAT_SIZE and 0 <= nc < MAT_SIZE:
+                    if env.wall_matrix[nr, nc] != WALL:
+                        img[nr, nc] = [255, 120, 120]
+
+        status = "GOAL REACHED!" if goal_reached else f"fire phase={phase}"
+        self._txt.set_text(f"step={step}  deaths={deaths}  {status}")
+        self._im.set_data(img)
+        self._fig.canvas.draw()
+        self._fig.canvas.flush_events()
+
+    def close(self):
+        if self._available:
+            try:
+                self._plt.close(self._fig)
+            except Exception:
+                pass
+
+
+# ================================================================
+# 8. Episode runners
+# ================================================================
+def run_episode(
+    env:          MazeEnvironment,
+    agent:        DynaQAgent,
+    max_turns:    int = 8000,
+    visualizer:   Optional[LiveVisualizer] = None,
+    vis_interval: int = 3,
+) -> dict:
     env.reset()
     agent.reset_episode()
 
     last = None
-    pl = 1
+    pl   = 1
 
-    for _ in range(max_turns):
+    for step in range(max_turns):
         acts = agent.plan_turn(last)
         last = env.step(acts)
-        pl += last.actions_executed
+
+        if acts and acts[0] != Action.WAIT and last.wall_hits == 0:
+            pl += 1
+
+        if visualizer and step % vis_interval == 0:
+            visualizer.update(env, env.pos, step, env.deaths,
+                               goal_reached=last.is_goal_reached)
+
         if last.is_goal_reached:
+            if visualizer:
+                visualizer.update(env, env.pos, step, env.deaths, goal_reached=True)
             break
 
     s = env.get_episode_stats()
     s["path_length"] = pl
-    s["turns"] = s["turns_taken"]
+    s["turns"]       = s["turns_taken"]
     return s
 
 
-def train_agent(env_id, n_ep=15, max_turns=6000, verbose=True):
-    env = MazeEnvironment(env_id)
-    agent = DynaQAgent()
-    agent.boot(env)
-
-    curve = []
-    for ep in range(n_ep):
-        s = run_episode(env, agent, max_turns)
-        curve.append(s)
-        if verbose:
-            print(
-                f"  Ep {ep+1:3d}: goal={s['goal_reached']!s:5} turns={s['turns']:5d} "
-                f"deaths={s['deaths']:3d} explored={s['cells_explored']:4d} path={s['path_length']:5d}"
-            )
-
-    return agent, curve, env
-
-
-def evaluate_agent(agent, env_id, n_ep=5, max_turns=8000, retain=True, verbose=True):
+def evaluate_agent(
+    agent:      DynaQAgent,
+    env_id:     str,
+    n_ep:       int  = 5,
+    max_turns:  int  = 8000,
+    retain:     bool = True,
+    verbose:    bool = True,
+    visualizer: Optional[LiveVisualizer] = None,
+) -> dict:
     if not retain:
         agent.reset_memory()
 
@@ -1001,120 +1159,271 @@ def evaluate_agent(agent, env_id, n_ep=5, max_turns=8000, retain=True, verbose=T
 
     eps = []
     for ep in range(n_ep):
-        s = run_episode(env, agent, max_turns)
+        s = run_episode(env, agent, max_turns, visualizer=visualizer)
         eps.append(s)
         if verbose:
             print(
-                f"  Eval {ep+1}: goal={s['goal_reached']!s:5} turns={s['turns']:5d} "
-                f"deaths={s['deaths']:3d} path={s['path_length']:5d}"
+                f"  Eval {ep+1}: goal={str(s['goal_reached']):<5}  "
+                f"turns={s['turns']:5d}  deaths={s['deaths']:3d}  "
+                f"path={s['path_length']:5d}"
             )
 
-    ok = [s for s in eps if s["goal_reached"]]
-    sr = len(ok) / len(eps)
+    ok  = [s for s in eps if s["goal_reached"]]
+    sr  = len(ok) / len(eps)
     apl = float(np.mean([s["path_length"] for s in ok])) if ok else float("nan")
-    at = float(np.mean([s["turns"] for s in ok])) if ok else float("nan")
-    td = sum(s["deaths"] for s in eps)
-    tt = sum(s["turns"] for s in eps)
-    dr = td / max(1, tt)
-    tu = sum(s["cells_explored"] for s in eps)
-    tv = sum(s["path_length"] for s in eps)
-    ee = tu / max(1, tv)
-    mc = len(agent.visit) / (NUM_CELLS * NUM_CELLS)
-    ar = agent._replan_t / max(1, agent._replan_n)
+    at  = float(np.mean([s["turns"]       for s in ok])) if ok else float("nan")
+    td  = sum(s["deaths"] for s in eps)
+    tt  = sum(s["turns"]  for s in eps)
+    dr  = td / max(1, tt)
+    tu  = sum(s["cells_explored"] for s in eps)
+    tv  = sum(s["path_length"]    for s in eps)
+    ee  = tu / max(1, tv)
+    mc  = len(agent.visit) / (NUM_CELLS * NUM_CELLS)
+    ar  = agent._replan_t / max(1, agent._replan_n)
 
     return {
-        "per_episode": eps,
-        "success_rate": sr,
-        "avg_path_length": apl,
-        "avg_turns": at,
-        "death_rate": dr,
+        "per_episode":            eps,
+        "success_rate":           sr,
+        "avg_path_length":        apl,
+        "avg_turns":              at,
+        "death_rate":             dr,
         "exploration_efficiency": ee,
-        "map_completeness": mc,
-        "avg_replanning_sec": ar,
+        "map_completeness":       mc,
+        "avg_replanning_sec":     ar,
     }
 
 
-COLORS = {
-    EMPTY: (255, 255, 255),
-    WALL: (20, 20, 20),
-    START: (60, 220, 60),
-    GOAL: (40, 110, 230),
-    DEATH_PIT: (230, 60, 30),
-    TELEPORT: (0, 190, 190),
-    CONFUSION: (170, 40, 220),
-    ARROW_UP: (60, 140, 240),
-    ARROW_DOWN: (60, 140, 240),
-    ARROW_LEFT: (60, 140, 240),
-    ARROW_RIGHT: (60, 140, 240),
-    FIRE: (255, 140, 0),
+# ================================================================
+# 9. Visualisation helpers
+# ================================================================
+CELL_COLORS = {
+    EMPTY:       (255, 255, 255),
+    WALL:        ( 20,  20,  20),
+    START:       ( 60, 220,  60),
+    GOAL:        ( 40, 110, 230),
+    DEATH_PIT:   (230,  60,  30),
+    TELEPORT:    (  0, 190, 190),
+    CONFUSION:   (170,  40, 220),
+    FIRE:        (255, 140,   0),
+    ARROW_UP:    ( 60, 140, 240),
+    ARROW_DOWN:  ( 60, 140, 240),
+    ARROW_LEFT:  ( 60, 140, 240),
+    ARROW_RIGHT: ( 60, 140, 240),
 }
 
 
-def render_solution(env, path, out, scale=6):
-    sz = MAT_SIZE * scale
+def render_solution(
+    env:   MazeEnvironment,
+    path:  List[Tuple[int,int]],
+    out:   str,
+    scale: int = 6,
+) -> None:
+    sz  = MAT_SIZE * scale
     img = Image.new("RGB", (sz, sz), (255, 255, 255))
-    d = ImageDraw.Draw(img)
+    d   = ImageDraw.Draw(img)
 
-    # Draw walls
     for r in range(MAT_SIZE):
         for c in range(MAT_SIZE):
             if env.wall_matrix[r, c] == WALL:
                 d.rectangle(
-                    [c * scale, r * scale, c * scale + scale - 1, r * scale + scale - 1],
+                    [c * scale, r * scale,
+                     c * scale + scale - 1, r * scale + scale - 1],
                     fill=(20, 20, 20),
                 )
 
-    # Draw hazards / special cells
     for (x, y), ct in env.cell_types.items():
         if ct in (START, GOAL):
-            continue  # we'll draw nicer circles for these later
-        col = COLORS.get(ct, (200, 200, 200))
+            continue
+        col = CELL_COLORS.get(ct, (200, 200, 200))
         mr, mc = y * 2, x * 2
         d.rectangle(
-            [mc * scale, mr * scale, mc * scale + scale - 1, mr * scale + scale - 1],
+            [mc * scale, mr * scale,
+             mc * scale + scale - 1, mr * scale + scale - 1],
             fill=col,
         )
 
-    # Draw clean solution path
     if path and len(path) > 1:
-        pts = [(x * 2 * scale + scale // 2, y * 2 * scale + scale // 2) for x, y in path]
+        pts = [(x * 2 * scale + scale // 2, y * 2 * scale + scale // 2)
+               for x, y in path]
         d.line(pts, fill=(255, 50, 50), width=max(2, scale // 2))
-
-        # Start marker
-        d.ellipse(
-            [pts[0][0] - scale, pts[0][1] - scale, pts[0][0] + scale, pts[0][1] + scale],
-            fill=(60, 220, 60),
-        )
-
-        # Goal marker
-        d.ellipse(
-            [pts[-1][0] - scale, pts[-1][1] - scale, pts[-1][0] + scale, pts[-1][1] + scale],
-            fill=(40, 110, 230),
-        )
+        r = scale
+        d.ellipse([pts[0][0]-r,  pts[0][1]-r,  pts[0][0]+r,  pts[0][1]+r],
+                   fill=(60, 220, 60))
+        d.ellipse([pts[-1][0]-r, pts[-1][1]-r, pts[-1][0]+r, pts[-1][1]+r],
+                   fill=(40, 110, 230))
 
     img.save(out)
+    print(f"  Saved: {out}")
 
 
-def trace_path(agent, env, max_turns=8000):
+def trace_path(
+    agent:     DynaQAgent,
+    env:       MazeEnvironment,
+    max_turns: int = 8000,
+) -> List[Tuple[int,int]]:
+    agent.boot(env)
     env.reset()
     agent.reset_episode()
 
-    path = [env.pos]
-    last = None
+    best_path  = [env.pos]
+    cur_path   = [env.pos]
+    last       = None
+    respawning = False
 
     for _ in range(max_turns):
         acts = agent.plan_turn(last)
         last = env.step(acts)
 
-        cur = env.pos
+        if respawning:
+            cur_path   = [env.pos]
+            respawning = False
 
-        if cur in path:
-            idx = path.index(cur)
-            path = path[:idx + 1]
+        if last.is_dead:
+            if len(cur_path) > len(best_path):
+                best_path = cur_path[:]
+            respawning = True
+            continue
+
+        cur = env.pos
+        if cur in cur_path:
+            idx      = cur_path.index(cur)
+            cur_path = cur_path[:idx + 1]
         else:
-            path.append(cur)
+            cur_path.append(cur)
 
         if last.is_goal_reached:
-            break
+            return cur_path
 
-    return path
+    return best_path if len(best_path) > len(cur_path) else cur_path
+
+
+# ================================================================
+# 10. Live solve  (single episode with live display)
+# ================================================================
+def visualize_solve(
+    maze_id: str,
+    max_turns: int = 8000,
+    agent: Optional[DynaQAgent] = None,
+):
+    """Run one episode on maze_id with a live matplotlib display."""
+    print(f"\nVisualizing solve on maze-{maze_id} ...")
+    env   = MazeEnvironment(maze_id)
+    if agent is None:
+        agent = DynaQAgent()
+    agent.boot(env)
+
+    vis = LiveVisualizer(env, title=f"Maze Solver -- {maze_id.upper()}")
+    s   = run_episode(env, agent, max_turns=max_turns,
+                      visualizer=vis, vis_interval=2)
+
+    print(f"  Result: goal={s['goal_reached']}  turns={s['turns']}  "
+          f"deaths={s['deaths']}  path={s['path_length']}")
+
+    if vis._available:
+        print("  (Close the window to continue)")
+        try:
+            vis._plt.show(block=True)
+        except Exception:
+            pass
+    vis.close()
+    return s
+
+
+# ================================================================
+# 11. Metrics printer
+# ================================================================
+def print_metrics(name: str, m: dict) -> None:
+    ok = m["success_rate"] == m["success_rate"]
+    print(f"\n{'--'*28}")
+    print(f"  METRICS -- {name.upper()}")
+    print(f"{'--'*28}")
+    print(f"  1. Success rate:            {m['success_rate']*100:.0f}%")
+    if ok and m["avg_path_length"] == m["avg_path_length"]:
+        print(f"  2. Avg path length:         {m['avg_path_length']:.0f}")
+    else:
+        print( "  2. Avg path length:         N/A (no successful episodes)")
+    if ok and m["avg_turns"] == m["avg_turns"]:
+        print(f"  3. Avg turns to solution:   {m['avg_turns']:.0f}")
+    else:
+        print( "  3. Avg turns to solution:   N/A")
+    print(f"  4. Death rate:              {m['death_rate']:.4f}")
+    print(f"  5. Exploration efficiency:  {m['exploration_efficiency']:.3f}")
+    print(f"  6. Map completeness:        {m['map_completeness']:.3f}")
+    print(f"  7. Avg replan time (ms):    {m['avg_replanning_sec']*1000:.2f}")
+
+
+# ================================================================
+# 12. Main
+# ================================================================
+if __name__ == "__main__":
+    MAX_TURNS_TRAIN = 5000
+    MAX_TURNS_EVAL  = 8000
+    N_TRAIN         = 20
+    N_EVAL          = 5
+
+    ROOT_OUT = os.path.join(MAZE_ROOT, "outputs")
+    os.makedirs(ROOT_OUT, exist_ok=True)
+
+    print("=" * 55)
+    print("COSC 4368 -- Check-in 3 | maze_solver.py")
+    print("Method: Dyna-Q (model-based RL) + time-aware BFS")
+    print("=" * 55)
+
+    agent = DynaQAgent()
+
+    # -- 1. Train on alpha
+    print(f"\n{'='*55}\nTRAIN ON MAZE-ALPHA  ({N_TRAIN} episodes)\n{'='*55}")
+    alpha_env = MazeEnvironment("alpha")
+    agent.boot(alpha_env)
+
+    for ep in range(N_TRAIN):
+        t = time.perf_counter()
+        s = run_episode(alpha_env, agent, MAX_TURNS_TRAIN)
+        print(
+            f"  Ep {ep+1:3d}: goal={str(s['goal_reached']):<5}  "
+            f"turns={s['turns']:5d}  deaths={s['deaths']:3d}  "
+            f"explored={s['cells_explored']:4d}  "
+            f"path={s['path_length']:5d}  ({time.perf_counter()-t:.1f}s)"
+        )
+
+    # -- 2. Evaluate on alpha
+    print(f"\n{'='*55}\nEVALUATE ON MAZE-ALPHA  ({N_EVAL} episodes)\n{'='*55}")
+    alpha_metrics = evaluate_agent(
+        agent, "alpha", n_ep=N_EVAL, max_turns=MAX_TURNS_EVAL,
+        retain=True, verbose=True,
+    )
+    path_a = trace_path(agent, MazeEnvironment("alpha"), MAX_TURNS_EVAL)
+    render_solution(MazeEnvironment("alpha"), path_a,
+                    os.path.join(ROOT_OUT, "solution_alpha.png"))
+
+    # -- 3. Evaluate on beta (zero-shot, no training)
+    print(f"\n{'='*55}\nEVALUATE ON MAZE-BETA  (zero-shot, {N_EVAL} episodes)\n{'='*55}")
+    beta_metrics = evaluate_agent(
+        agent, "beta", n_ep=N_EVAL, max_turns=MAX_TURNS_EVAL,
+        retain=True, verbose=True,
+    )
+    path_b = trace_path(agent, MazeEnvironment("beta"), MAX_TURNS_EVAL)
+    render_solution(MazeEnvironment("beta"), path_b,
+                    os.path.join(ROOT_OUT, "solution_beta.png"))
+
+    # -- 4. Evaluate on gamma (extra credit)
+    print(f"\n{'='*55}\nEVALUATE ON MAZE-GAMMA  (extra credit)\n{'='*55}")
+    try:
+        gamma_metrics = evaluate_agent(
+            agent, "gamma", n_ep=N_EVAL, max_turns=MAX_TURNS_EVAL,
+            retain=True, verbose=True,
+        )
+        path_g = trace_path(agent, MazeEnvironment("gamma"), MAX_TURNS_EVAL)
+        render_solution(MazeEnvironment("gamma"), path_g,
+                        os.path.join(ROOT_OUT, "solution_gamma.png"))
+    except Exception as exc:
+        print(f"  Gamma failed: {exc}")
+        gamma_metrics = None
+
+    # -- 5. Summary
+    print(f"\n{'='*55}\nFINAL SUMMARY\n{'='*55}")
+    print_metrics("alpha", alpha_metrics)
+    print_metrics("beta",  beta_metrics)
+    if gamma_metrics:
+        print_metrics("gamma", gamma_metrics)
+    print()
