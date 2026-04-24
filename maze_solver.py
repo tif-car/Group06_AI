@@ -17,7 +17,7 @@ from __future__ import annotations
 import colorsys
 import os
 import time
-from collections import defaultdict, deque
+from collections import defaultdict, deque, Counter #!----------
 from dataclasses import dataclass
 from enum import Enum
 from typing import Dict, List, Optional, Set, Tuple
@@ -315,16 +315,74 @@ def assemble_map(
                     comp.add(nxt)
         components.append(comp)
 
-    for comp in components:
-        # Pivot = bottommost cell (highest y), middle x among ties
-        max_y  = max(y for _, y in comp)
-        bottom = sorted([p for p in comp if p[1] == max_y], key=lambda p: p[0])
-        pivot  = bottom[len(bottom) // 2]
+    def choose_v_pivot(comp: Set[Tuple[int, int]]) -> Tuple[int, int]:
+        """
+        Pick the actual V-junction instead of guessing top/bottom/center.
+        The pivot should be the cell where the two arms of the V meet.
+        """
+        comp_set = set(comp)
+
+        # These are the four possible V orientations.
+        diagonal_pairs = [
+            [(-1, -1), (1, -1)],  # arms above pivot
+            [(-1,  1), (1,  1)],  # arms below pivot
+            [(-1, -1), (-1, 1)],  # arms left of pivot
+            [(1, -1), (1, 1)],    # arms right of pivot
+        ]
+
+        cx = sum(x for x, _ in comp) / len(comp)
+        cy = sum(y for _, y in comp) / len(comp)
+
+        best_cell = None
+        best_score = -999999
+
+        for x, y in comp:
+            score = 0
+
+            # Strongly reward the actual V-junction pattern.
+            for pair in diagonal_pairs:
+                if all((x + dx, y + dy) in comp_set for dx, dy in pair):
+                    score += 100
+
+            # Reward nearby fire neighbors.
+            for dx in [-1, 0, 1]:
+                for dy in [-1, 0, 1]:
+                    if dx == 0 and dy == 0:
+                        continue
+                    if (x + dx, y + dy) in comp_set:
+                        score += 5
+
+            # Tie-breaker: prefer cells near the center of the component.
+            dist2 = (x - cx) ** 2 + (y - cy) ** 2
+            score -= dist2
+
+            if score > best_score:
+                best_score = score
+                best_cell = (x, y)
+
+        return best_cell
+
+
+    real_fire_components = [comp for comp in components if len(comp) >= 5]
+
+    for comp in real_fire_components:
+        pivot = choose_v_pivot(comp)
+
         fire_pivots.add(pivot)
-        # Store ALL cluster cell offsets relative to pivot (including (0,0))
-        fire_clusters[pivot] = [(p[0] - pivot[0], p[1] - pivot[1]) for p in comp]
+
+        fire_clusters[pivot] = [
+            (p[0] - pivot[0], p[1] - pivot[1])
+            for p in comp
+        ]
+
         for p in comp:
             ct[p] = FIRE
+
+        print("[FIRE PIVOT DEBUG]")
+        print("Component:", sorted(comp))
+        print("Chosen pivot:", pivot)
+        print()
+    
 
     ct[s] = START
     ct[g] = GOAL
@@ -360,9 +418,18 @@ class MazeEnvironment:
             raise ValueError(f"Unknown maze_id '{maze_id}'. Use: {list(self.CFGS)}")
         bp, hp = self.CFGS[maze_id]
 
-        self.wall_matrix            = load_walls(bp)
+        self.wall_matrix = load_walls(bp)
         self.start_xy, self.goal_xy = find_sg(bp)
-        raw_hz                      = detect_hazards(hp)
+        raw_hz = detect_hazards(hp)
+
+        print("\n[RAW HAZARD DEBUG]")
+        print("maze:", maze_id)
+        print("hazard image:", hp)
+        print("raw categories:", Counter(raw_hz.values()))
+
+        for cat in sorted(set(raw_hz.values())):
+            cells = sorted([pos for pos, value in raw_hz.items() if value == cat])
+            print(cat, len(cells), cells[:30])
 
         (self.cell_types,
          self.teleport_pairs,
@@ -383,20 +450,45 @@ class MazeEnvironment:
                             self.wall_matrix[y * 2 + dy, x * 2 + dx] == WALL
                         )
 
-        # Precompute deadly tip sets for all 4 rotation phases.
-        # phase = (action_index // FIRE_PER) % 4
-        self._fire_deadly: List[Set[Tuple[int,int]]] = [set() for _ in range(4)]
-        rot_off = [(0, -1), (1, 0), (0, 1), (-1, 0)]
+        #! Precompute deadly fire/death trap cells for all 4 rotation phases.
+        #! Each phase rotates the ENTIRE fire cluster 90 degrees clockwise around its pivot.
+        #! phase = (action_index // FIRE_PER) % 4
+
+        self._fire_deadly: List[Set[Tuple[int, int]]] = [set() for _ in range(4)]
+
         for phase in range(4):
-            cells: Set[Tuple[int,int]] = set()
-            dx, dy = rot_off[phase]
-            for pivot in self.fire_pivots:
-                cell = (pivot[0] + dx, pivot[1] + dy)
-                if 0 <= cell[0] < NUM_CELLS and 0 <= cell[1] < NUM_CELLS:
-                    cells.add(cell)
+
+            cells: Set[Tuple[int, int]] = set()
+
+            for pivot, offsets in self.fire_clusters.items():
+
+                px, py = pivot
+
+                for dx, dy in offsets:
+
+                    rdx, rdy = _rotate_cw(dx, dy, phase)
+
+                    cell = (px + rdx, py + rdy)
+
+                    if 0 <= cell[0] < NUM_CELLS and 0 <= cell[1] < NUM_CELLS:
+
+                        cells.add(cell)
+
             self._fire_deadly[phase] = cells
 
         self.reset()
+        
+        #!DEBUGGING REMOVE WHEN FINISHED
+        print("\n[FIRE DEBUG]")
+        print("Fire clusters:", len(self.fire_clusters))
+
+        for pivot, offsets in self.fire_clusters.items():
+            absolute_cells = [(pivot[0] + dx, pivot[1] + dy) for dx, dy in offsets]
+            print("Pivot:", pivot)
+            print("Cells:", sorted(absolute_cells))
+            print("Offsets:", sorted(offsets))
+            print()
+        
 
     # ------------------------------------------------------------------
     def reset(self) -> Tuple[int, int]:
