@@ -17,7 +17,7 @@ from __future__ import annotations
 import colorsys
 import os
 import time
-from collections import defaultdict, deque, Counter #!----------
+from collections import defaultdict, deque #!----------
 import random
 from dataclasses import dataclass
 from enum import Enum
@@ -643,6 +643,8 @@ class DynaQAgent:
 
     # ------------------------------------------------------------------
     def reset_memory(self):
+        self._recent_positions = deque(maxlen=12)
+        self.confusion_cells = set()
         self.open_p:      Set  = set()
         self.blocked_p:   Set  = set()
         self._neighbors:  Dict = {}
@@ -651,6 +653,11 @@ class DynaQAgent:
         self.death_cells: Set  = set()
         self.fire_adj:    Set  = set()
         self.visit:       Dict = defaultdict(int)
+
+        self._last_pos_for_stuck = None#!DEBUGGING
+        self._same_pos_count = 0 #!DEBUGGING
+
+        self._force_single_until = 0 #!DEBUGGING
 
         self.start_xy    = None
         self.goal_xy     = None
@@ -674,6 +681,10 @@ class DynaQAgent:
         self._script_idx:       int   = 0
 
     def reset_episode(self):
+        self._recent_positions.clear()
+        self._last_pos_for_stuck = None
+        self._same_pos_count = 0
+        self._force_single_until = 0
         #!DEBUGGING REMOVE WHEN FINISHED
         self._stuck_count = 0
         #!DEBUGGING REMOVE WHEN FINISHED
@@ -903,15 +914,32 @@ class DynaQAgent:
             return
         prev          = self.current_pos
         new           = res.current_position
+        was_confused_before_turn = self.confused
         self.confused = res.is_confused
+        #!DEBUGGING#############################
+        # If a multi-action batch hit a wall, we cannot know exactly
+        # which action caused the collision. Clear the stale plan and
+        # temporarily return to one-action probing.
+        if res.wall_hits > 0 and len(self._last_acts) > 1:
+            self._plan = []
+            self._force_single_until = self._ep_turn + 20
 
+        # If we attempted movement but did not change position, avoid repeating
+        # the same plan forever.
+        if (
+            res.wall_hits > 0
+            and prev == new
+            and self._last_acts
+            and any(a != Action.WAIT for a in self._last_acts)
+        ):
+            self._plan = []
+            self._force_single_until = self._ep_turn + 20
+        #!DEBUGGING#############################
         if res.is_dead:
             dc = new
             self.death_cells.add(dc)
-#!##########################################DEBUGGING####################################################################################
             self.danger[dc] = 999.0
             print(f"[DEATH LEARNED] died_at={dc} known_deaths={len(self.death_cells)}")
-#!##########################################DEBUGGING####################################################################################
             for ddx, ddy in DIRS4:
                 nx, ny = dc[0] + ddx, dc[1] + ddy
                 if 0 <= nx < NUM_CELLS and 0 <= ny < NUM_CELLS:
@@ -920,6 +948,21 @@ class DynaQAgent:
 
         self.visit[new] += 1
         self.current_pos = new
+        self._recent_positions.append(new)
+
+        # If we ended a turn confused, treat this area as suspicious.
+        # Confusion cells are not deadly, but they are causing the agent to get trapped.
+        if res.is_confused and new is not None:
+            self.confusion_cells.add(new)
+            self.danger[new] = max(self.danger.get(new, 0), 3.0)
+
+            # Stop trusting the current path after confusion.
+            self._plan = []
+            self._goal_path_cache = []
+
+            # Use one-action turns for a bit so feedback is easier to interpret.
+            self._force_single_until = self._ep_turn + 50
+        
         self._total_actions += getattr(res, "actions_executed", 1)
 
         if not res.is_dead and self.danger.get(new, 0) > 0.01:
@@ -927,9 +970,21 @@ class DynaQAgent:
             if self.danger[new] < 0.01:
                 del self.danger[new]
 
-        if not res.teleported and not res.is_dead and prev and self._last_acts:
-            self._infer(prev, new, self._last_acts,
-                        res.actions_executed, res.wall_hits, res.is_confused)
+        if (
+            not res.teleported
+            and not res.is_dead
+            and not res.is_confused
+            and prev
+            and self._last_acts
+        ):
+            self._infer(
+                prev,
+                new,
+                self._last_acts,
+                res.actions_executed,
+                res.wall_hits,
+                was_confused_before_turn,
+            )
 
         if new == self.goal_xy:
             self.goal_known = True
@@ -1079,6 +1134,7 @@ class DynaQAgent:
             if self._is_blocked(self.current_pos, nxt):
                 continue
 
+
             if nxt in self.death_cells:
                 continue
 
@@ -1087,6 +1143,9 @@ class DynaQAgent:
 
             # Prefer less visited cells.
             score = self.visit[nxt]
+
+            if nxt in self.confusion_cells:
+                score += 500
 
             # Strongly avoid immediately revisiting the start loop.
             if nxt == self.start_xy:
@@ -1110,6 +1169,56 @@ class DynaQAgent:
     
     def plan_turn(self, res: Optional[TurnResult]) -> List[Action]:
         self._update(res)
+        # Detect being stuck in same cell for too long
+        if self.current_pos == self._last_pos_for_stuck:
+            self._same_pos_count += 1
+        else:
+            self._same_pos_count = 0
+            self._last_pos_for_stuck = self.current_pos
+
+        #! Detect 2-cell loop: A, B, A, B, A, B...
+        if len(self._recent_positions) >= 6:
+            recent = list(self._recent_positions)[-6:]
+
+            two_cell_loop = (
+                recent[0] == recent[2] == recent[4]
+                and recent[1] == recent[3] == recent[5]
+                and recent[0] != recent[1]
+            )
+
+            if two_cell_loop:
+                self._plan = []
+                self._goal_path_cache = []
+
+                # Penalize both loop cells so BFS/exploration avoids them
+                self.danger[recent[0]] = max(self.danger.get(recent[0], 0), 4.0)
+                self.danger[recent[1]] = max(self.danger.get(recent[1], 0), 4.0)
+
+                act = self._simple_explore_action()
+                self._last_acts = [act]
+                return [act]
+
+        # If stuck, clear corrupted plan and force random escape
+        if self._same_pos_count >= 20:
+            self._plan = []
+            self._goal_path_cache = []
+
+            escape_actions = [
+                Action.MOVE_UP,
+                Action.MOVE_DOWN,
+                Action.MOVE_LEFT,
+                Action.MOVE_RIGHT,
+            ]
+
+            # Try a random direction instead of repeating the same bad choice
+            act = random.choice(escape_actions)
+
+            if self.confused:
+                act = IA[act]
+
+            self._last_acts = [act]
+            self._same_pos_count = 0
+            return [act]
 
         
         # ---- Dyna-Q fallback ----
@@ -1199,8 +1308,43 @@ class DynaQAgent:
         #!##########################################DEBUGGING####################################################################################
         acts = self._path_to_acts(self._plan)
 
-        # TEMP DEBUG: one action per turn makes wall/death inference much cleaner.
-        acts = acts[:1]
+        # Hybrid batching:
+        # - If following confirmed open edges, allow up to 5 actions.
+        # - If the next edge is unknown, only take 1 action so wall feedback is clear.
+        safe_batch = True
+        pos = self.current_pos
+
+        for a in acts:
+            if a == Action.WAIT:
+                break
+
+            dx, dy = AV[a]
+            nxt = (pos[0] + dx, pos[1] + dy)
+
+            if not (0 <= nxt[0] < NUM_CELLS and 0 <= nxt[1] < NUM_CELLS):
+                safe_batch = False
+                break
+
+            # If this edge is not confirmed open, only take 1 action.
+            if not self._is_open(pos, nxt):
+                safe_batch = False
+                break
+
+            # Do not batch into known deadly cells.
+            if nxt in self.death_cells or self.danger.get(nxt, 0) >= 999:
+                safe_batch = False
+                break
+
+            pos = nxt
+
+
+        if self._ep_turn < self._force_single_until:
+            acts = acts[:1]
+        elif not safe_batch:
+            acts = acts[:1]
+
+        if self._ep_turn % 250 == 0:
+            print(f"[BATCH DEBUG] turn ={self._ep_turn} actions={len(acts)} pos={self.current_pos}")
 
         self._last_acts = acts
         return acts
@@ -1394,10 +1538,13 @@ def evaluate_agent(
     ar  = agent._replan_t / max(1, agent._replan_n)
 
     return {
-        "per_episode":            eps,
-        "success_rate":           sr,
-        "avg_path_length":        apl,
-        "avg_turns":              at,
+        "per_episode":              eps,
+        "success_rate":             sr,
+        "avg_path_length":          apl,
+        "avg_turns":                at,
+        "total_deaths":             td,
+        "total_turns":              tt,
+        "avg_deaths":     td / len(eps),
         "death_rate":             dr,
         "exploration_efficiency": ee,
         "map_completeness":       mc,
@@ -1558,18 +1705,22 @@ def print_metrics(name: str, m: dict) -> None:
         print(f"  3. Avg turns to solution:   {m['avg_turns']:.0f}")
     else:
         print( "  3. Avg turns to solution:   N/A")
-    print(f"  4. Death rate:              {m['death_rate']:.4f}")
+    print(f"  4. Death rate:              {m['death_rate']:.8f}")
     print(f"  5. Exploration efficiency:  {m['exploration_efficiency']:.3f}")
     print(f"  6. Map completeness:        {m['map_completeness']:.3f}")
     print(f"  7. Avg replan time (ms):    {m['avg_replanning_sec']*1000:.2f}")
+    print(f"  4. Death rate:              {m['death_rate']:.8f}")
+    print(f"     Total deaths:            {m['total_deaths']}")
+    print(f"     Total turns:             {m['total_turns']}")
+    print(f"     Avg deaths/episode:      {m['avg_deaths']:.2f}")
 
 
 # ================================================================
 # 12. Main
 # ================================================================
 if __name__ == "__main__":
-    MAX_TURNS_TRAIN = 5000
-    MAX_TURNS_EVAL  = 8000
+    MAX_TURNS_TRAIN = 10000
+    MAX_TURNS_EVAL  = 10000
     N_TRAIN         = 20
     N_EVAL          = 5
 
