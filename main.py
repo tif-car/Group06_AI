@@ -3,6 +3,7 @@ COSC 4368 Check-in 3 — run this file.
 Usage: python main.py
 Requires: pip install numpy pillow scipy
 """
+#update
 
 import os
 import time
