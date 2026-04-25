@@ -92,8 +92,10 @@ def evaluate_and_render(agent, maze_id, max_turns=3000, n_eval=5):
 def main():
     import sys
     live = "--live" in sys.argv       # pass --live to show real-time window
-    max_turns = 10000
-    n_train_alpha = 20
+    #! DEBUGGING!#####################################
+    max_turns = 1500
+    n_train_alpha = 3
+    #! DEBUGGING!#####################################
     n_eval = 5
 
     agent = DynaQAgent()

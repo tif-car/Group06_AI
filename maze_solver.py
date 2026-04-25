@@ -18,6 +18,7 @@ import colorsys
 import os
 import time
 from collections import defaultdict, deque, Counter #!----------
+import random
 from dataclasses import dataclass
 from enum import Enum
 from typing import Dict, List, Optional, Set, Tuple
@@ -378,10 +379,10 @@ def assemble_map(
         for p in comp:
             ct[p] = FIRE
 
-        print("[FIRE PIVOT DEBUG]")
-        print("Component:", sorted(comp))
-        print("Chosen pivot:", pivot)
-        print()
+        # print("[FIRE PIVOT DEBUG]")
+        # print("Component:", sorted(comp))
+        # print("Chosen pivot:", pivot)
+        # print()
     
 
     ct[s] = START
@@ -422,10 +423,10 @@ class MazeEnvironment:
         self.start_xy, self.goal_xy = find_sg(bp)
         raw_hz = detect_hazards(hp)
 
-        print("\n[RAW HAZARD DEBUG]")
-        print("maze:", maze_id)
-        print("hazard image:", hp)
-        print("raw categories:", Counter(raw_hz.values()))
+        # print("\n[RAW HAZARD DEBUG]")
+        # print("maze:", maze_id)
+        # print("hazard image:", hp)
+        # print("raw categories:", Counter(raw_hz.values()))
 
         for cat in sorted(set(raw_hz.values())):
             cells = sorted([pos for pos, value in raw_hz.items() if value == cat])
@@ -479,15 +480,15 @@ class MazeEnvironment:
         self.reset()
         
         #!DEBUGGING REMOVE WHEN FINISHED
-        print("\n[FIRE DEBUG]")
-        print("Fire clusters:", len(self.fire_clusters))
+        # print("\n[FIRE DEBUG]")
+        # print("Fire clusters:", len(self.fire_clusters))
 
-        for pivot, offsets in self.fire_clusters.items():
-            absolute_cells = [(pivot[0] + dx, pivot[1] + dy) for dx, dy in offsets]
-            print("Pivot:", pivot)
-            print("Cells:", sorted(absolute_cells))
-            print("Offsets:", sorted(offsets))
-            print()
+        # for pivot, offsets in self.fire_clusters.items():
+        #     absolute_cells = [(pivot[0] + dx, pivot[1] + dy) for dx, dy in offsets]
+        #     print("Pivot:", pivot)
+        #     print("Cells:", sorted(absolute_cells))
+        #     print("Offsets:", sorted(offsets))
+        #     print()
         
 
     # ------------------------------------------------------------------
@@ -655,7 +656,10 @@ class DynaQAgent:
         self.goal_xy     = None
         self.current_pos = None
         self.goal_known  = False
-
+#!DEBUGGING REMOVE WHEN FINISHED
+        self._explore_dir_idx = 0
+        self._stuck_count = 0
+#!DEBUGGING REMOVE WHEN FINISHED
         self._last_acts:        List  = []
         self._plan:             List  = []
         self.confused:          bool  = False
@@ -670,6 +674,9 @@ class DynaQAgent:
         self._script_idx:       int   = 0
 
     def reset_episode(self):
+        #!DEBUGGING REMOVE WHEN FINISHED
+        self._stuck_count = 0
+        #!DEBUGGING REMOVE WHEN FINISHED
         self.current_pos    = self.start_xy
         self._last_acts     = []
         self._plan          = []
@@ -798,45 +805,28 @@ class DynaQAgent:
 
         self._boot_signature = sig
         self.fire_cells = set(getattr(env, "fire_cells", set()))
-
-        for src, dst in env.teleport_pairs.items():
-            self.tele_pairs[src] = dst
-            self.tele_pairs[dst] = src
-
+#!##########################################DEBUGGING####################################################################################
+        # do not preload teleport pairs. the agent learns them after telep
+        # for src, dst in env.teleport_pairs.items():
+        #     self.tele_pairs[src] = dst
+        #     self.tele_pairs[dst] = src
+#!##########################################DEBUGGING####################################################################################
         for pivot in env.fire_pivots:
             for ddx, ddy in DIRS4:
                 nx, ny = pivot[0] + ddx, pivot[1] + ddy
                 if 0 <= nx < NUM_CELLS and 0 <= ny < NUM_CELLS:
                     self.fire_adj.add((nx, ny))
-
-        for x in range(NUM_CELLS):
-            for y in range(NUM_CELLS):
-                for ddx, ddy in DIRS4:
-                    nx, ny = x + ddx, y + ddy
-                    if 0 <= nx < NUM_CELLS and 0 <= ny < NUM_CELLS:
-                        if env._wc.get(((x, y), (nx, ny)), False):
-                            self._mark_blocked((x, y), (nx, ny))
-
+#!##########################################DEBUGGING####################################################################################
+  
+#!##########################################DEBUGGING####################################################################################
+                            
         self._neighbors = {}
-        for x in range(NUM_CELLS):
-            for y in range(NUM_CELLS):
-                nb = []
-                for ddx, ddy in DIRS4:
-                    nx, ny = x + ddx, y + ddy
-                    if 0 <= nx < NUM_CELLS and 0 <= ny < NUM_CELLS:
-                        if not self._is_blocked((x, y), (nx, ny)):
-                            nb.append((nx, ny))
-                self._neighbors[(x, y)] = nb
 
-        print(f"  Computing route {env.start_xy} -> {env.goal_xy} ...", end=" ", flush=True)
-        t0 = time.perf_counter()
-        self._scripted_actions = self._compute_scripted_route(env)
-        elapsed = time.perf_counter() - t0
-        if self._scripted_actions:
-            print(f"found {len(self._scripted_actions)} steps ({elapsed:.2f}s)")
-        else:
-            print(f"no path found ({elapsed:.2f}s) -- using Dyna-Q exploration")
+#!##########################################DEBUGGING####################################################################################
+
+        self._scripted_actions = []
         self._script_idx = 0
+        print("  Full-map scripted route disabled; using exploration/learning.")
 
     # ------------------------------------------------------------------
     def _edge(self, a, b):
@@ -847,6 +837,55 @@ class DynaQAgent:
 
     def _is_blocked(self, a, b):
         return self._edge(a, b) in self.blocked_p
+    
+    def _known_neighbors(self, pos):
+        """Neighbors connected by edges the agent has confirmed open."""
+        out = []
+        x, y = pos
+
+        for dx, dy in DIRS4:
+            nxt = (x + dx, y + dy)
+
+            if not (0 <= nxt[0] < NUM_CELLS and 0 <= nxt[1] < NUM_CELLS):
+                continue
+
+            if self._is_blocked(pos, nxt):
+                continue
+
+            if self._is_open(pos, nxt):
+                out.append(nxt)
+
+        return out
+
+
+    def _candidate_neighbors(self, pos, allow_unknown=True):
+        """
+        Neighbors for planning.
+        Known-open edges are always allowed.
+        Unknown edges are allowed only when exploring/frontier searching.
+        """
+        out = []
+        x, y = pos
+
+        for dx, dy in DIRS4:
+            nxt = (x + dx, y + dy)
+
+            if not (0 <= nxt[0] < NUM_CELLS and 0 <= nxt[1] < NUM_CELLS):
+                continue
+
+            if self._is_blocked(pos, nxt):
+                continue
+
+            if nxt in self.death_cells:
+                continue
+
+            if self.danger.get(nxt, 0) >= 999:
+                continue
+
+            if self._is_open(pos, nxt) or allow_unknown:
+                out.append(nxt)
+
+        return out
 
     def _mark_open(self, a, b):
         e = self._edge(a, b)
@@ -869,7 +908,10 @@ class DynaQAgent:
         if res.is_dead:
             dc = new
             self.death_cells.add(dc)
-            self.danger[dc] = min(0.45, self.danger.get(dc, 0) + 0.08)
+#!##########################################DEBUGGING####################################################################################
+            self.danger[dc] = 999.0
+            print(f"[DEATH LEARNED] died_at={dc} known_deaths={len(self.death_cells)}")
+#!##########################################DEBUGGING####################################################################################
             for ddx, ddy in DIRS4:
                 nx, ny = dc[0] + ddx, dc[1] + ddy
                 if 0 <= nx < NUM_CELLS and 0 <= ny < NUM_CELLS:
@@ -932,8 +974,10 @@ class DynaQAgent:
                 if dst not in vis:
                     vis.add(dst)
                     q.append((dst, path + [dst]))
-            for nxt in self._neighbors.get(pos, []):
+            for nxt in self._candidate_neighbors(pos, allow_unknown=allow_unknown):
                 if nxt in vis:
+                    continue
+                if nxt in self.death_cells:
                     continue
                 if not allow_unknown and not self._is_open(pos, nxt):
                     continue
@@ -949,28 +993,44 @@ class DynaQAgent:
         return None
 
     def _frontier_bfs(self, danger_thresh=0.9):
-        q   = deque([(self.current_pos, [self.current_pos])])
+        """
+        Find the nearest unknown edge reachable through known-open space.
+        This prevents fake paths through walls.
+        """
+        q = deque([(self.current_pos, [self.current_pos])])
         vis = {self.current_pos}
+
         while q:
             pos, path = q.popleft()
             x, y = pos
+
             for ddx, ddy in DIRS4:
                 nxt = (x + ddx, y + ddy)
+
                 if not (0 <= nxt[0] < NUM_CELLS and 0 <= nxt[1] < NUM_CELLS):
                     continue
+
                 if self._is_blocked(pos, nxt):
                     continue
+
+                if nxt in self.death_cells:
+                    continue
+
                 if self.danger.get(nxt, 0) > danger_thresh:
                     continue
+
+                # This is the nearest unknown edge.
                 if not self._is_open(pos, nxt):
                     return path + [nxt]
-                if nxt in vis:
-                    continue
-                vis.add(nxt)
-                q.append((nxt, path + [nxt]))
+
+                # Only expand through confirmed open edges.
+                if nxt not in vis:
+                    vis.add(nxt)
+                    q.append((nxt, path + [nxt]))
+
         return None
 
-    # ------------------------------------------------------------------
+    
     def _path_to_acts(self, path: List) -> List[Action]:
         acts = []
         for i in range(len(path) - 1):
@@ -988,27 +1048,86 @@ class DynaQAgent:
             acts = [IA[a] for a in acts]
         return acts
 
-    # ------------------------------------------------------------------
+    def _simple_explore_action(self) -> Action:
+        """
+        Honest exploration policy:
+        Try one action at a time so wall feedback is easy to interpret.
+
+        Right-hand-ish priority with visit-count tie breaking.
+        """
+        if self.current_pos is None:
+            return Action.WAIT
+
+        x, y = self.current_pos
+
+        candidates = [
+            Action.MOVE_RIGHT,
+            Action.MOVE_DOWN,
+            Action.MOVE_LEFT,
+            Action.MOVE_UP,
+        ]
+
+        scored = []
+
+        for a in candidates:
+            dx, dy = AV[a]
+            nxt = (x + dx, y + dy)
+
+            if not (0 <= nxt[0] < NUM_CELLS and 0 <= nxt[1] < NUM_CELLS):
+                continue
+
+            if self._is_blocked(self.current_pos, nxt):
+                continue
+
+            if nxt in self.death_cells:
+                continue
+
+            if self.danger.get(nxt, 0) >= 999:
+                continue
+
+            # Prefer less visited cells.
+            score = self.visit[nxt]
+
+            # Strongly avoid immediately revisiting the start loop.
+            if nxt == self.start_xy:
+                score += 1000
+
+            # Prefer cells farther from start so it actually expands outward.
+            if self.start_xy is not None:
+                score -= 0.05 * (abs(nxt[0] - self.start_xy[0]) + abs(nxt[1] - self.start_xy[1]))
+
+            # Small penalty for known fire cells, but do not fully ban forever.
+            if hasattr(self, "fire_cells") and nxt in self.fire_cells:
+                score += 50
+
+            scored.append((score, random.random(), a))
+
+        if not scored:
+            return Action.WAIT
+
+        scored.sort()
+        return scored[0][2]
+    
     def plan_turn(self, res: Optional[TurnResult]) -> List[Action]:
         self._update(res)
 
-        # Scripted (pre-computed optimal) route takes priority
-        if self._scripted_actions and self._script_idx < len(self._scripted_actions):
-            act = self._scripted_actions[self._script_idx]
-            self._script_idx += 1
-            self._last_acts = [act]
-            return [act]
-
+        
         # ---- Dyna-Q fallback ----
         if res and res.is_dead:
             self.current_pos = self.start_xy
+
+            # Death means the previous plan is unsafe.
+            # Do not reuse cached goal paths after dying.
+            self._plan = []
+            self._goal_path_cache = []
+
+            # Wait briefly only if we died to rotating fire.
+            # Then force fresh frontier exploration.
             dc = res.current_position
-            if dc and dc in self.fire_adj:
-                self._fire_cooloff = 3
-                self._plan = self._goal_path_cache if self._goal_path_cache else []
+            if dc and dc in self.fire_cells:
+                self._fire_cooloff = 1
             else:
                 self._fire_cooloff = 0
-                self._plan = []
 
         if self.current_pos == self.goal_xy:
             self._last_acts = [Action.WAIT]
@@ -1022,14 +1141,6 @@ class DynaQAgent:
 
         self._ep_turn += 1
 
-        if self._ep_turn > 200:
-            plan_ok = len(self._plan) >= 2 and self._plan[-1] == self.goal_xy
-            if not plan_ok:
-                path = self._bfs(self.current_pos, self.goal_xy,
-                                  allow_unknown=True, danger_thresh=0.99)
-                if path and len(path) >= 2:
-                    self._plan = path
-                    self._goal_path_cache = path
 
         if self._plan:
             if self.current_pos in self._plan:
@@ -1065,13 +1176,17 @@ class DynaQAgent:
                 if path is None:
                     path = self._bfs(self.current_pos, self.goal_xy,
                                       allow_unknown=True, danger_thresh=2.0)
-
+            #!##########################################DEBUGGING####################################################################################
             if not path:
-                acts = [Action.WAIT]
+                self._plan = []
+                act = self._simple_explore_action()
+                acts = [act]
                 self._last_acts = acts
                 return acts
-            self._plan = path
 
+            #save the path  we just found
+            self._plan = path 
+            #!##########################################DEBUGGING####################################################################################
         if (len(self._plan) >= 2
                 and self._plan[1] in self.fire_adj
                 and self._plan[1] in self.death_cells):
@@ -1081,10 +1196,15 @@ class DynaQAgent:
                 acts = [Action.WAIT] * 5
                 self._last_acts = acts
                 return acts
-
+        #!##########################################DEBUGGING####################################################################################
         acts = self._path_to_acts(self._plan)
+
+        # TEMP DEBUG: one action per turn makes wall/death inference much cleaner.
+        acts = acts[:1]
+
         self._last_acts = acts
         return acts
+        #!##########################################DEBUGGING####################################################################################
 
 
 # ================================================================
