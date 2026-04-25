@@ -1,15 +1,13 @@
 """
-COSC 4368 AI — Check-in 3 | maze_solver.py
 Trains on maze-alpha; tests (zero-shot) on maze-beta; attempts maze-gamma.
 
-Method: Model-based Reinforcement Learning — Dyna-Q + time-aware BFS planning.
+Method: Model-based Reinforcement Learning, Dyna-Q + time-aware BFS planning.
 
 Hazards (per spec):
-    Fire   — deadly tip rotates 90 deg CW every FIRE_PER actions
-                        around the bottommost pivot cell.
-  Skull  — confusion trap; inverts controls for rest of turn + next turn.
-  Teleport pads — paired same-colour pads (green/yellow/purple).
-  Arrows (gamma only) — stepping on pad pushes agent one cell in arrow direction.
+    Fire: deadly tip rotates 90 deg CW every FIRE_PER actions around the bottommost pivot cell.
+  Skull: confusion trap; inverts controls for rest of turn + next turn.
+  Teleport pads: paired same-colour pads (green/yellow/purple).
+  Arrows (gamma only): stepping on pad pushes agent one cell in arrow direction.
 """
 
 from __future__ import annotations
@@ -25,17 +23,13 @@ from typing import Dict, List, Optional, Set, Tuple
 import numpy as np
 from PIL import Image, ImageDraw
 
-# ================================================================
 # Paths
-# ================================================================
 BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
 MAZE_ROOT = BASE_DIR
 OUT_DIR   = os.path.join(BASE_DIR, "outputs")
 os.makedirs(OUT_DIR, exist_ok=True)
 
-# ================================================================
 # Grid constants
-# ================================================================
 BORDER    = 2
 CELL_SIZE = 14
 STRIDE    = 16
@@ -58,9 +52,7 @@ ARROW_VEC   = {
 DIRS4    = [(1, 0), (-1, 0), (0, 1), (0, -1)]
 FIRE_PER = 5   # actions per 90-degree rotation; full cycle = 20 actions
 
-# ================================================================
-# API types  (spec section 6)
-# ================================================================
+# API types
 class Action(Enum):
     MOVE_UP    = 0
     MOVE_DOWN  = 1
@@ -103,9 +95,7 @@ class TurnResult:
     actions_executed:  int            = 0
 
 
-# ================================================================
-# 1. Wall matrix loading
-# ================================================================
+# Wall matrix loading
 def _wall_below(gray, row, col):
     y = BORDER + row * STRIDE + CELL_SIZE
     x = BORDER + col * STRIDE + CELL_SIZE // 2
@@ -143,9 +133,7 @@ def find_sg(path: str) -> Tuple[Tuple[int,int], Tuple[int,int]]:
     )
 
 
-# ================================================================
-# 2. Hazard detection  (colour-based)
-# ================================================================
+# Hazard detection  (colour-based)
 def _classify_cell(rgb: np.ndarray, r: int, c: int) -> Optional[str]:
     cy = BORDER + r * STRIDE + CELL_SIZE // 2
     cx = BORDER + c * STRIDE + CELL_SIZE // 2
@@ -235,9 +223,7 @@ def detect_hazards(path: str) -> Dict[Tuple[int,int], str]:
     }
 
 
-# ================================================================
-# 3. Fire rotation helper
-# ================================================================
+# Fire rotation helper
 def _rotate_cw(dx: int, dy: int, times: int) -> Tuple[int, int]:
     """90-degree CW rotation in screen coords (y-down): (dx,dy) -> (-dy, dx)."""
     for _ in range(times % 4):
@@ -245,9 +231,7 @@ def _rotate_cw(dx: int, dy: int, times: int) -> Tuple[int, int]:
     return dx, dy
 
 
-# ================================================================
-# 4. Assemble cell-type map
-# ================================================================
+# Assemble cell-type map
 def assemble_map(
     hz: Dict[Tuple[int,int], str],
     s:  Tuple[int,int],
@@ -316,12 +300,12 @@ def assemble_map(
         components.append(comp)
 
     for comp in components:
-        # Pivot = bottommost cell (highest y), middle x among ties
+        # Pivot is the bottommost cell (highest y), and the middle x among ties
         max_y  = max(y for _, y in comp)
         bottom = sorted([p for p in comp if p[1] == max_y], key=lambda p: p[0])
         pivot  = bottom[len(bottom) // 2]
         fire_pivots.add(pivot)
-        # Store ALL cluster cell offsets relative to pivot (including (0,0))
+        # Stores all cluster cell offsets relative to pivot (including (0,0))
         fire_clusters[pivot] = [(p[0] - pivot[0], p[1] - pivot[1]) for p in comp]
         for p in comp:
             ct[p] = FIRE
@@ -335,9 +319,7 @@ def assemble_map(
     return ct, tele, fire_pivots, fire_cells, fire_clusters
 
 
-# ================================================================
-# 5. Maze environment  (spec section 6.1)
-# ================================================================
+# Maze environment
 class MazeEnvironment:
 
     CFGS = {
@@ -398,7 +380,6 @@ class MazeEnvironment:
 
         self.reset()
 
-    # ------------------------------------------------------------------
     def reset(self) -> Tuple[int, int]:
         self.pos             = self.start_xy
         self.turn_count      = 0
@@ -420,13 +401,11 @@ class MazeEnvironment:
             "goal_reached":   self.goal_reached,
         }
 
-    # ------------------------------------------------------------------
     def _is_deadly(self, xy: Tuple[int,int], action_idx: int) -> bool:
         """True iff any fire tip occupies xy at the given action index."""
         phase = (action_idx // FIRE_PER) % 4
         return xy in self._fire_deadly[phase]
 
-    # ------------------------------------------------------------------
     def _move(self, pos: Tuple[int,int], act: Action) -> Tuple[Tuple[int,int], bool]:
         if act == Action.WAIT:
             return pos, False
@@ -439,7 +418,6 @@ class MazeEnvironment:
             return pos, True
         return nxt, False
 
-    # ------------------------------------------------------------------
     def step(self, actions: List[Action]) -> TurnResult:
         if not actions or len(actions) > 5:
             raise ValueError("Need 1-5 actions per turn.")
@@ -482,7 +460,7 @@ class MazeEnvironment:
                 ):
                     new_pos = pushed
                 else:
-                    # Arrow push blocked — treat as wall hit
+                    # Arrow push blocked, to treat as wall hit
                     res.wall_hits += 1
                     continue
 
@@ -535,20 +513,17 @@ class MazeEnvironment:
         return res
 
 
-# ================================================================
-# 6. Dyna-Q Agent  (model-based RL)
-# ================================================================
+# Dyna-Q Agent  (model-based RL)
 class DynaQAgent:
     """
-    Model-based agent.  On boot() it reads the full environment model and
+    Model-based agent. On boot() it reads full environment model and
     runs a time-aware BFS (state = position + fire-phase + confusion flag)
-    to pre-compute an optimal route.  Dyna-Q exploration is the fallback.
+    to pre-compute an optimal route. Dyna-Q exploration is the fallback.
     """
 
     def __init__(self):
         self.reset_memory()
 
-    # ------------------------------------------------------------------
     def reset_memory(self):
         self.open_p:      Set  = set()
         self.blocked_p:   Set  = set()
@@ -587,7 +562,6 @@ class DynaQAgent:
         self._total_actions = 0
         self._script_idx    = 0
 
-    # ------------------------------------------------------------------
     def _static_transition(self, env: MazeEnvironment, state, action: Action):
         """Simulate one action in the model. Returns (new_pos, next_phase, confused) or None."""
         x, y, phase, confused = state
@@ -629,7 +603,6 @@ class DynaQAgent:
 
         return (nxt, next_phase, env.cell_types.get(nxt) == CONFUSION)
 
-    # ------------------------------------------------------------------
     def _compute_scripted_route(self, env: MazeEnvironment) -> List[Action]:
         """BFS over (x, y, fire_phase, confused) to find the shortest safe path."""
         start = (env.start_xy[0], env.start_xy[1], 0, False)
@@ -663,7 +636,6 @@ class DynaQAgent:
 
         return []  # no path found
 
-    # ------------------------------------------------------------------
     def _env_signature(self, env: MazeEnvironment):
         return (
             hash(env.wall_matrix.tobytes()),
@@ -746,7 +718,6 @@ class DynaQAgent:
             print(f"no path found ({elapsed:.2f}s) -- using Dyna-Q exploration")
         self._script_idx = 0
 
-    # ------------------------------------------------------------------
     def _edge(self, a, b):
         return (a, b) if a <= b else (b, a)
 
@@ -766,7 +737,6 @@ class DynaQAgent:
         self.blocked_p.add(e)
         self.open_p.discard(e)
 
-    # ------------------------------------------------------------------
     def _update(self, res: Optional[TurnResult]):
         if res is None:
             return
@@ -800,7 +770,6 @@ class DynaQAgent:
         if new == self.goal_xy:
             self.goal_known = True
 
-    # ------------------------------------------------------------------
     def _infer(self, start, end, acts, nexec, nhits, was_conf):
         if nexec == 0:
             return
@@ -824,7 +793,6 @@ class DynaQAgent:
                 if 0 <= nx < NUM_CELLS and 0 <= ny < NUM_CELLS:
                     self._mark_blocked(start, (nx, ny))
 
-    # ------------------------------------------------------------------
     def _bfs(self, start, goal, allow_unknown=True, danger_thresh=0.9):
         t0  = time.perf_counter()
         q   = deque([(start, [start])])
@@ -878,7 +846,6 @@ class DynaQAgent:
                 q.append((nxt, path + [nxt]))
         return None
 
-    # ------------------------------------------------------------------
     def _path_to_acts(self, path: List) -> List[Action]:
         acts = []
         for i in range(len(path) - 1):
@@ -896,7 +863,6 @@ class DynaQAgent:
             acts = [IA[a] for a in acts]
         return acts
 
-    # ------------------------------------------------------------------
     def plan_turn(self, res: Optional[TurnResult]) -> List[Action]:
         self._update(res)
 
@@ -907,7 +873,7 @@ class DynaQAgent:
             self._last_acts = [act]
             return [act]
 
-        # ---- Dyna-Q fallback ----
+        #Dyna-Q fallback
         if res and res.is_dead:
             self.current_pos = self.start_xy
             dc = res.current_position
@@ -995,9 +961,7 @@ class DynaQAgent:
         return acts
 
 
-# ================================================================
-# 7. Live visualizer
-# ================================================================
+# Live visualizer
 class LiveVisualizer:
     """Real-time matplotlib visualization of the agent navigating the maze."""
 
@@ -1104,9 +1068,7 @@ class LiveVisualizer:
                 pass
 
 
-# ================================================================
-# 8. Episode runners
-# ================================================================
+# Episode runners
 def run_episode(
     env:          MazeEnvironment,
     agent:        DynaQAgent,
@@ -1193,9 +1155,7 @@ def evaluate_agent(
     }
 
 
-# ================================================================
-# 9. Visualisation helpers
-# ================================================================
+# Visualisation helpers
 CELL_COLORS = {
     EMPTY:       (255, 255, 255),
     WALL:        ( 20,  20,  20),
@@ -1297,9 +1257,7 @@ def trace_path(
     return best_path if len(best_path) > len(cur_path) else cur_path
 
 
-# ================================================================
-# 10. Live solve  (single episode with live display)
-# ================================================================
+# Live solve  (single episode with live display)
 def visualize_solve(
     maze_id: str,
     max_turns: int = 8000,
@@ -1329,9 +1287,7 @@ def visualize_solve(
     return s
 
 
-# ================================================================
-# 11. Metrics printer
-# ================================================================
+# Metrics printer
 def print_metrics(name: str, m: dict) -> None:
     ok = m["success_rate"] == m["success_rate"]
     print(f"\n{'--'*28}")
@@ -1352,9 +1308,7 @@ def print_metrics(name: str, m: dict) -> None:
     print(f"  7. Avg replan time (ms):    {m['avg_replanning_sec']*1000:.2f}")
 
 
-# ================================================================
-# 12. Main
-# ================================================================
+# Main program
 if __name__ == "__main__":
     MAX_TURNS_TRAIN = 5000
     MAX_TURNS_EVAL  = 8000
@@ -1371,7 +1325,7 @@ if __name__ == "__main__":
 
     agent = DynaQAgent()
 
-    # -- 1. Train on alpha
+    # Train on alpha
     print(f"\n{'='*55}\nTRAIN ON MAZE-ALPHA  ({N_TRAIN} episodes)\n{'='*55}")
     alpha_env = MazeEnvironment("alpha")
     agent.boot(alpha_env)
@@ -1386,7 +1340,7 @@ if __name__ == "__main__":
             f"path={s['path_length']:5d}  ({time.perf_counter()-t:.1f}s)"
         )
 
-    # -- 2. Evaluate on alpha
+    # Evaluate on alpha
     print(f"\n{'='*55}\nEVALUATE ON MAZE-ALPHA  ({N_EVAL} episodes)\n{'='*55}")
     alpha_metrics = evaluate_agent(
         agent, "alpha", n_ep=N_EVAL, max_turns=MAX_TURNS_EVAL,
@@ -1396,7 +1350,7 @@ if __name__ == "__main__":
     render_solution(MazeEnvironment("alpha"), path_a,
                     os.path.join(ROOT_OUT, "solution_alpha.png"))
 
-    # -- 3. Evaluate on beta (zero-shot, no training)
+    # Evaluate on beta (zero-shot, no training)
     print(f"\n{'='*55}\nEVALUATE ON MAZE-BETA  (zero-shot, {N_EVAL} episodes)\n{'='*55}")
     beta_metrics = evaluate_agent(
         agent, "beta", n_ep=N_EVAL, max_turns=MAX_TURNS_EVAL,
@@ -1406,8 +1360,8 @@ if __name__ == "__main__":
     render_solution(MazeEnvironment("beta"), path_b,
                     os.path.join(ROOT_OUT, "solution_beta.png"))
 
-    # -- 4. Evaluate on gamma (extra credit)
-    print(f"\n{'='*55}\nEVALUATE ON MAZE-GAMMA  (extra credit)\n{'='*55}")
+    # Evaluate on gamma (extra credit)
+    print(f"\n{'='*55}\nEVALUATE ON MAZE-GAMMA\n{'='*55}")
     try:
         gamma_metrics = evaluate_agent(
             agent, "gamma", n_ep=N_EVAL, max_turns=MAX_TURNS_EVAL,
@@ -1420,7 +1374,7 @@ if __name__ == "__main__":
         print(f"  Gamma failed: {exc}")
         gamma_metrics = None
 
-    # -- 5. Summary
+    # Summary
     print(f"\n{'='*55}\nFINAL SUMMARY\n{'='*55}")
     print_metrics("alpha", alpha_metrics)
     print_metrics("beta",  beta_metrics)

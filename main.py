@@ -1,10 +1,3 @@
-"""
-COSC 4368 Check-in 3 — run this file.
-Usage: python main.py
-Requires: pip install numpy pillow scipy
-"""
-#update
-
 import os
 import time
 from maze_solver import (
@@ -83,7 +76,7 @@ def evaluate_and_render(agent, maze_id, max_turns=3000, n_eval=5):
     )
 
     env = MazeEnvironment(maze_id)
-    agent.boot(env)  # load this maze into the same trained agent
+    agent.boot(env)  # loading this maze into the same trained agent
     path = trace_path(agent, env, max_turns=max_turns)
     render_solution(env, path, f"outputs/solution_{maze_id}.png", scale=6)
 
@@ -124,9 +117,9 @@ def main():
     if live:
         visualize_solve("beta", max_turns=max_turns, agent=agent)
 
-    # 4) Evaluate on gamma (extra credit)
+    # 4) Evaluate on gamma
     print(f"\n{'=' * 55}")
-    print("EVALUATE ON GAMMA (extra credit)")
+    print("EVALUATE ON GAMMA")
     print(f"{'=' * 55}")
     try:
         gamma_metrics = evaluate_and_render(
