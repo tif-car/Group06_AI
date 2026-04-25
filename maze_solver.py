@@ -643,6 +643,12 @@ class DynaQAgent:
 
     # ------------------------------------------------------------------
     def reset_memory(self):
+        self._routes_by_signature = {}
+        self.confused_turns_left = 0
+        self._replay_idx = 0
+        self._episode_actions = []
+        self._segment_actions = []
+        self._best_success_actions = []
         self._recent_positions = deque(maxlen=12)
         self.confusion_cells = set()
         self.open_p:      Set  = set()
@@ -681,6 +687,10 @@ class DynaQAgent:
         self._script_idx:       int   = 0
 
     def reset_episode(self):
+        self.confused_turns_left = 0
+        self._replay_idx = 0
+        self._episode_actions = []
+        self._segment_actions = []
         self._recent_positions.clear()
         self._last_pos_for_stuck = None
         self._same_pos_count = 0
@@ -697,6 +707,11 @@ class DynaQAgent:
         self._total_actions = 0
         self._script_idx    = 0
 
+    def _commit_actions(self, acts: List[Action]) -> List[Action]:
+        self._last_acts = acts
+        self._episode_actions.extend(acts)
+        self._segment_actions.extend(acts)
+        return acts
     # ------------------------------------------------------------------
     def _static_transition(self, env: MazeEnvironment, state, action: Action):
         """Simulate one action in the model. Returns (new_pos, next_phase, confused) or None."""
@@ -785,6 +800,8 @@ class DynaQAgent:
 
     def boot(self, env: MazeEnvironment):
         sig          = self._env_signature(env)
+        self._current_sig = sig
+        self._best_success_actions = self._routes_by_signature.get(sig, [])
         maze_changed = sig != self._boot_signature
 
         self.start_xy    = env.start_xy
@@ -805,6 +822,12 @@ class DynaQAgent:
             self._plan            = []
             self.confused         = False
             self._goal_path_cache = []
+
+            # Clear saved successful route when switching to a different maze.
+            self._best_success_actions = self._routes_by_signature.get(sig, [])
+            self._episode_actions = []
+            self._segment_actions = []
+            self._replay_idx = 0
         else:
             self.blocked_p  = set()
             self._neighbors = {}
@@ -835,9 +858,13 @@ class DynaQAgent:
 
 #!##########################################DEBUGGING####################################################################################
 
-        self._scripted_actions = []
+        self._scripted_actions = self._compute_scripted_route(env)
         self._script_idx = 0
-        print("  Full-map scripted route disabled; using exploration/learning.")
+
+        if self._scripted_actions:
+            print(f"  Full-map scripted route enabled: {len(self._scripted_actions)} actions.")
+        else:
+            print("  No scripted route found; using exploration/learning.")
 
     # ------------------------------------------------------------------
     def _edge(self, a, b):
@@ -914,8 +941,21 @@ class DynaQAgent:
             return
         prev          = self.current_pos
         new           = res.current_position
-        was_confused_before_turn = self.confused
-        self.confused = res.is_confused
+        was_confused_before_turn = self.confused_turns_left > 0
+
+        if self.confused_turns_left > 0:
+
+            self.confused_turns_left -= 1
+
+        if res.is_confused:
+
+            # rest of this turn is already handled by environment,
+
+            # next agent decision must still be inverted
+
+            self.confused_turns_left = max(self.confused_turns_left, 1)
+
+        self.confused = self.confused_turns_left > 0
         #!DEBUGGING#############################
         # If a multi-action batch hit a wall, we cannot know exactly
         # which action caused the collision. Clear the stale plan and
@@ -940,6 +980,8 @@ class DynaQAgent:
             self.death_cells.add(dc)
             self.danger[dc] = 999.0
             print(f"[DEATH LEARNED] died_at={dc} known_deaths={len(self.death_cells)}")
+            # death respawn the agent at the start so previous actiona are not a clean route
+            self._segment_actions = []
             for ddx, ddy in DIRS4:
                 nx, ny = dc[0] + ddx, dc[1] + ddy
                 if 0 <= nx < NUM_CELLS and 0 <= ny < NUM_CELLS:
@@ -988,6 +1030,24 @@ class DynaQAgent:
 
         if new == self.goal_xy:
             self.goal_known = True
+
+            # Save only the clean segment since the last death/episode start.
+            candidate = self._segment_actions[:]
+
+            # If goal was reached mid-batch, remove actions that were submitted
+            # but never actually executed.
+            if self._last_acts:
+                extra = len(self._last_acts) - res.actions_executed
+                if extra > 0:
+                    candidate = candidate[:-extra]
+
+            if candidate and (not self._best_success_actions or len(candidate) < len(self._best_success_actions)):
+                self._best_success_actions = candidate
+
+                if hasattr(self, "_current_sig"):
+                    self._routes_by_signature[self._current_sig] = candidate
+
+                print(f"[ROUTE SAVED] clean_actions={len(self._best_success_actions)}")
 
     # ------------------------------------------------------------------
     def _infer(self, start, end, acts, nexec, nhits, was_conf):
@@ -1169,6 +1229,42 @@ class DynaQAgent:
     
     def plan_turn(self, res: Optional[TurnResult]) -> List[Action]:
         self._update(res)
+
+        # 1. Replay known successful route first.
+        if self._best_success_actions and self._replay_idx == 0:
+            print(f"[REPLAY START] actions={len(self._best_success_actions)}")
+
+        if self._best_success_actions and self._replay_idx < len(self._best_success_actions):
+            if res and (res.is_dead or res.wall_hits > 0):
+                print("[REPLAY FAILED] abandoning saved route")
+                self._replay_idx = len(self._best_success_actions)
+
+                # Do not also mark scripted route as failed from this same bad replay result.
+                # Let fallback exploration handle this turn.
+            else:
+                # Replay one action at a time to preserve timing.
+                chunk = self._best_success_actions[self._replay_idx:self._replay_idx + 1]
+                self._replay_idx += len(chunk)
+                return self._commit_actions(chunk)
+
+        # 2. If no learned route exists, use full-map scripted route.
+        if self._scripted_actions and self._script_idx < len(self._scripted_actions):
+            if res and (res.is_dead or res.wall_hits > 0):
+                # Only scripted mode should fail if the previous submitted action came from scripted mode.
+                # For now, safer option: reset script index and try from current episode only if no replay failed.
+                print("[SCRIPT PAUSED] previous failure was not necessarily from script")
+                self._script_idx = len(self._scripted_actions)
+            else:
+                chunk = self._scripted_actions[self._script_idx:self._script_idx + 1]
+                self._script_idx += len(chunk)
+                return self._commit_actions(chunk)
+            
+
+        # Only cancel replay if the route actually failed.
+        # Confusion and teleport do not mean failure; they may be part of the saved route.
+        if res and (res.is_dead or res.wall_hits > 0):
+            self._replay_idx = len(self._best_success_actions)
+
         # Detect being stuck in same cell for too long
         if self.current_pos == self._last_pos_for_stuck:
             self._same_pos_count += 1
@@ -1195,8 +1291,7 @@ class DynaQAgent:
                 self.danger[recent[1]] = max(self.danger.get(recent[1], 0), 4.0)
 
                 act = self._simple_explore_action()
-                self._last_acts = [act]
-                return [act]
+                return self._commit_actions([act])
 
         # If stuck, clear corrupted plan and force random escape
         if self._same_pos_count >= 20:
@@ -1216,9 +1311,9 @@ class DynaQAgent:
             if self.confused:
                 act = IA[act]
 
-            self._last_acts = [act]
             self._same_pos_count = 0
-            return [act]
+            return self._commit_actions([act])
+
 
         
         # ---- Dyna-Q fallback ----
@@ -1239,14 +1334,12 @@ class DynaQAgent:
                 self._fire_cooloff = 0
 
         if self.current_pos == self.goal_xy:
-            self._last_acts = [Action.WAIT]
-            return [Action.WAIT]
+            return self._commit_actions([Action.WAIT])
 
         if self._fire_cooloff > 0:
             self._fire_cooloff -= 1
             acts = [Action.WAIT] * 5
-            self._last_acts = acts
-            return acts
+            return self._commit_actions(acts)
 
         self._ep_turn += 1
 
@@ -1281,17 +1374,44 @@ class DynaQAgent:
                         if path:
                             break
             else:
-                path = self._frontier_bfs(danger_thresh=0.99)
-                if path is None:
-                    path = self._bfs(self.current_pos, self.goal_xy,
-                                      allow_unknown=True, danger_thresh=2.0)
+                # Sometimes try moving toward the goal even before we have fully confirmed a route.
+                if self._ep_turn > 2500:
+                    path = self._bfs(
+                        self.current_pos,
+                        self.goal_xy,
+                        allow_unknown=True,
+                        danger_thresh=2.0,
+                    )
+                    if path is None:
+                        path = self._frontier_bfs(danger_thresh=0.99)
+                else:
+                    # Early episode: explore safely.
+                    if self._ep_turn < 2500:
+                        path = self._frontier_bfs(danger_thresh=0.99)
+                        if path is None:
+                            path = self._bfs(
+                                self.current_pos,
+                                self.goal_xy,
+                                allow_unknown=True,
+                                danger_thresh=2.0,
+                            )
+
+                    # Later episode: stop wandering and push toward the goal.
+                    else:
+                        path = self._bfs(
+                            self.current_pos,
+                            self.goal_xy,
+                            allow_unknown=True,
+                            danger_thresh=2.0,
+                        )
+                        if path is None:
+                            path = self._frontier_bfs(danger_thresh=1.5)
             #!##########################################DEBUGGING####################################################################################
             if not path:
                 self._plan = []
                 act = self._simple_explore_action()
                 acts = [act]
-                self._last_acts = acts
-                return acts
+                return self._commit_actions(acts)
 
             #save the path  we just found
             self._plan = path 
@@ -1303,8 +1423,7 @@ class DynaQAgent:
             phase = (ta // FIRE_PER) % 4
             if phase in (1, 2):
                 acts = [Action.WAIT] * 5
-                self._last_acts = acts
-                return acts
+                return self._commit_actions(acts)
         #!##########################################DEBUGGING####################################################################################
         acts = self._path_to_acts(self._plan)
 
@@ -1346,8 +1465,7 @@ class DynaQAgent:
         if self._ep_turn % 250 == 0:
             print(f"[BATCH DEBUG] turn ={self._ep_turn} actions={len(acts)} pos={self.current_pos}")
 
-        self._last_acts = acts
-        return acts
+        return self._commit_actions(acts)
         #!##########################################DEBUGGING####################################################################################
 
 
@@ -1488,6 +1606,12 @@ def run_episode(
                                goal_reached=last.is_goal_reached)
 
         if last.is_goal_reached:
+            # IMPORTANT:
+            # The episode ends immediately after reaching the goal,
+            # so plan_turn() will NOT be called again with this final result.
+            # We must manually let the agent process the successful final turn.
+            agent._update(last)
+
             if visualizer:
                 visualizer.update(env, env.pos, step, env.deaths, goal_reached=True)
             break
@@ -1719,6 +1843,10 @@ def print_metrics(name: str, m: dict) -> None:
 # 12. Main
 # ================================================================
 if __name__ == "__main__":
+
+    random.seed(7)
+    np.random.seed(7)
+
     MAX_TURNS_TRAIN = 10000
     MAX_TURNS_EVAL  = 10000
     N_TRAIN         = 20
@@ -1748,6 +1876,10 @@ if __name__ == "__main__":
             f"explored={s['cells_explored']:4d}  "
             f"path={s['path_length']:5d}  ({time.perf_counter()-t:.1f}s)"
         )
+
+        if agent._best_success_actions:
+            print(f"  Route found, saved {len(agent._best_success_actions)} actions.")
+            break
 
     # -- 2. Evaluate on alpha
     print(f"\n{'='*55}\nEVALUATE ON MAZE-ALPHA  ({N_EVAL} episodes)\n{'='*55}")

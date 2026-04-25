@@ -94,7 +94,7 @@ def main():
     live = "--live" in sys.argv       # pass --live to show real-time window
     #! DEBUGGING!#####################################
     max_turns = 10000
-    n_train_alpha = 5
+    n_train_alpha = 20
     #! DEBUGGING!#####################################
     n_eval = 5
 
